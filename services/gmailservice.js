@@ -2,6 +2,7 @@ const { google } = require("googleapis");
 const { Email } = require("../models");
 const userService = require("./userservice");
 const { Op } = require("sequelize");
+const processingService = require("./processingservice");
 
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
@@ -187,11 +188,16 @@ const gmailService = {
         sender_name: senderName,
         received_at: date ? new Date(date) : null,
         is_read: !labels.includes("UNREAD"),
-       
+
         gmail_link: `https://mail.google.com/mail/u/0/#inbox/${message.id}`
       });
 
       savedEmails.push(email);
+
+      // Auto-trigger Llama3 priority analysis (non-blocking)
+      processingService.analyzeEmail(email.id).catch(err =>
+        console.error(`[Priority] Failed to analyze email ${email.id}:`, err.message)
+      );
     }
 
     return savedEmails;
