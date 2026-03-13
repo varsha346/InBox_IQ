@@ -24,7 +24,7 @@ module.exports = (sequelize, DataTypes) => {
     received_at: DataTypes.DATE,
 
     is_read: DataTypes.BOOLEAN,
-    is_archived: DataTypes.BOOLEAN,
+    
 
     gmail_link: DataTypes.TEXT
 
