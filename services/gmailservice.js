@@ -150,14 +150,6 @@ const gmailService = {
     const savedEmails = [];
 
     for (const message of messages) {
-      const exists = await Email.findOne({
-        where: { gmail_message_id: message.id }
-      });
-
-      if (exists) {
-        continue;
-      }
-
       const msg = await gmail.users.messages.get({
         userId: "me",
         id: message.id,
@@ -176,6 +168,24 @@ const gmailService = {
       const fromMatch = from.match(/^(.*?)\s*<(.+?)>$|^(.+?)$/);
       const senderName = fromMatch ? (fromMatch[1] || fromMatch[3] || "") : "";
       const senderEmail = fromMatch ? (fromMatch[2] || fromMatch[3] || "") : "";
+
+      const exists = await Email.findOne({
+        where: { gmail_message_id: message.id }
+      });
+
+      if (exists) {
+        await exists.update({
+          gmail_thread_id: msg.data.threadId,
+          subject,
+          snippet,
+          sender_email: senderEmail,
+          sender_name: senderName,
+          received_at: date ? new Date(date) : null,
+          is_read: !labels.includes("UNREAD"),
+          gmail_link: `https://mail.google.com/mail/u/0/#inbox/${message.id}`
+        });
+        continue;
+      }
 
       const email = await Email.create({
         user_id: userId,
