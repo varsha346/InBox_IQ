@@ -14,6 +14,64 @@ const SCOPES = [
 ];
 
 const gmailService = {
+  resolveTopicName(inputTopicName) {
+    const raw = String(inputTopicName || "").trim().replace(/^['\"]|['\"]$/g, "");
+    if (!raw) return null;
+
+    if (/^projects\/[\w-]+\/topics\/[\w.-]+$/.test(raw)) {
+      return raw;
+    }
+
+    const fullPathMatch = raw.match(/projects\/([\w-]+)\/topics\/([\w.-]+)/);
+    if (fullPathMatch) {
+      return `projects/${fullPathMatch[1]}/topics/${fullPathMatch[2]}`;
+    }
+
+    const projectId = (process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || "").trim();
+    if (!projectId) return null;
+
+    return `projects/${projectId}/topics/${raw}`;
+  },
+
+  createOAuthClient(accessToken, refreshToken, tokenExpiry) {
+    const oauth2Client = new google.auth.OAuth2(
+      CLIENT_ID,
+      CLIENT_SECRET,
+      REDIRECT_URI
+    );
+
+    oauth2Client.setCredentials({
+      access_token: accessToken,
+      refresh_token: refreshToken,
+      expiry_date: tokenExpiry
+    });
+
+    return oauth2Client;
+  },
+
+  async getGmailClientForUser(userId) {
+    const user = await userService.getUserById(userId);
+
+    if (!user.encrypted_access_token) {
+      const error = new Error("User not authenticated");
+      error.statusCode = 401;
+      throw error;
+    }
+
+    const oauth2Client = gmailService.createOAuthClient(
+      user.encrypted_access_token,
+      user.encrypted_refresh_token,
+      user.token_expiry
+    );
+
+    const gmail = google.gmail({
+      version: "v1",
+      auth: oauth2Client
+    });
+
+    return { user, gmail };
+  },
+
   async login(req, res) {
     try {
       const oauth2Client = new google.auth.OAuth2(
@@ -74,7 +132,7 @@ const gmailService = {
 
       await userService.saveTokens(user.id, tokens);
 
-      const emails = await gmailService.fetchEmailsFromGmail(
+      const fetchResult = await gmailService.fetchEmailsFromGmail(
         user.id,
         tokens.access_token,
         tokens.refresh_token,
@@ -83,8 +141,8 @@ const gmailService = {
 
       return res.json({
         message: "Login successful",
-        // user,
-        emailsFetched: emails.length
+        emailsFetched: fetchResult.newEmails.length,
+        unreadSync: fetchResult.unreadSync
       });
     } catch (error) {
       return res.status(500).json({
@@ -104,7 +162,7 @@ const gmailService = {
         });
       }
 
-      const emails = await gmailService.fetchEmailsFromGmail(
+      const fetchResult = await gmailService.fetchEmailsFromGmail(
         user.id,
         user.encrypted_access_token,
         user.encrypted_refresh_token,
@@ -113,8 +171,9 @@ const gmailService = {
 
       return res.json({
         message: "Emails fetched successfully",
-        count: emails.length,
-        emails
+        count: fetchResult.newEmails.length,
+        emails: fetchResult.newEmails,
+        unreadSync: fetchResult.unreadSync
       });
     } catch (error) {
       return res.status(500).json({
@@ -123,18 +182,120 @@ const gmailService = {
     }
   },
 
-  async fetchEmailsFromGmail(userId, accessToken, refreshToken, tokenExpiry) {
-    const oauth2Client = new google.auth.OAuth2(
-      CLIENT_ID,
-      CLIENT_SECRET,
-      REDIRECT_URI
-    );
+  async startWatch(req, res) {
+    try {
+      const { userId } = req.params;
+      const { topicName, labelIds } = req.body || {};
+      const configuredTopic = topicName || process.env.GMAIL_PUBSUB_TOPIC;
+      const resolvedTopic = gmailService.resolveTopicName(configuredTopic);
 
-    oauth2Client.setCredentials({
-      access_token: accessToken,
-      refresh_token: refreshToken,
-      expiry_date: tokenExpiry
-    });
+      if (!resolvedTopic) {
+        return res.status(400).json({
+          error: "Invalid topic name format. Use 'projects/<project-id>/topics/<topic-id>' or set GCP_PROJECT_ID with topic id.",
+          received: {
+            topicNameFromBody: topicName || null,
+            topicFromEnv: process.env.GMAIL_PUBSUB_TOPIC || null,
+            projectIdFromEnv: process.env.GCP_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || null
+          }
+        });
+      }
+
+      const { gmail } = await gmailService.getGmailClientForUser(userId);
+
+      const watchResponse = await gmail.users.watch({
+        userId: "me",
+        requestBody: {
+          topicName: resolvedTopic,
+          labelIds: Array.isArray(labelIds) && labelIds.length ? labelIds : ["INBOX"],
+          labelFilterAction: "include"
+        }
+      });
+
+      return res.json({
+        message: "Gmail watch started",
+        data: watchResponse.data
+      });
+    } catch (error) {
+      return res.status(error.statusCode || 500).json({
+        error: error.message || "Failed to start Gmail watch"
+      });
+    }
+  },
+
+  async stopWatch(req, res) {
+    try {
+      const { userId } = req.params;
+      const { gmail } = await gmailService.getGmailClientForUser(userId);
+
+      await gmail.users.stop({ userId: "me" });
+
+      return res.json({
+        message: "Gmail watch stopped"
+      });
+    } catch (error) {
+      return res.status(error.statusCode || 500).json({
+        error: error.message || "Failed to stop Gmail watch"
+      });
+    }
+  },
+
+  async pubsubWebhook(req, res) {
+    try {
+      const envelope = req.body;
+
+      if (!envelope || !envelope.message || !envelope.message.data) {
+        return res.status(200).json({
+          message: "No Pub/Sub message data"
+        });
+      }
+
+      const decoded = Buffer.from(envelope.message.data, "base64").toString("utf8");
+      const notification = JSON.parse(decoded);
+      const emailAddress = notification.emailAddress;
+
+      if (!emailAddress) {
+        return res.status(200).json({
+          message: "Notification missing emailAddress"
+        });
+      }
+
+      const user = await userService.getUserByEmailAddress(emailAddress);
+
+      if (!user.encrypted_access_token) {
+        return res.status(200).json({
+          message: "User has no valid token",
+          emailAddress
+        });
+      }
+
+      const fetchResult = await gmailService.fetchEmailsFromGmail(
+        user.id,
+        user.encrypted_access_token,
+        user.encrypted_refresh_token,
+        user.token_expiry
+      );
+
+      return res.status(200).json({
+        message: "Notification processed",
+        emailAddress,
+        newEmails: fetchResult.newEmails.length,
+        unreadSync: fetchResult.unreadSync,
+        historyId: notification.historyId || null
+      });
+    } catch (error) {
+      return res.status(200).json({
+        message: "Notification received with processing error",
+        error: error.message
+      });
+    }
+  },
+
+  async fetchEmailsFromGmail(userId, accessToken, refreshToken, tokenExpiry) {
+    const oauth2Client = gmailService.createOAuthClient(
+      accessToken,
+      refreshToken,
+      tokenExpiry
+    );
 
     const gmail = google.gmail({
       version: "v1",
@@ -204,7 +365,60 @@ const gmailService = {
       savedEmails.push(email);
     }
 
-    return savedEmails;
+    const unreadSync = await gmailService.syncUnreadStatuses(userId, gmail);
+
+    return {
+      newEmails: savedEmails,
+      unreadSync
+    };
+  },
+
+  async syncUnreadStatuses(userId, gmailClient) {
+    const unreadEmails = await Email.findAll({
+      where: {
+        user_id: userId,
+        is_read: false
+      },
+      attributes: ["id", "gmail_message_id"]
+    });
+
+    let markedRead = 0;
+    let stillUnread = 0;
+    let failed = 0;
+
+    for (const email of unreadEmails) {
+      if (!email.gmail_message_id) {
+        failed++;
+        continue;
+      }
+
+      try {
+        const gmailMessage = await gmailClient.users.messages.get({
+          userId: "me",
+          id: email.gmail_message_id,
+          format: "metadata"
+        });
+
+        const labels = gmailMessage.data.labelIds || [];
+        const isReadNow = !labels.includes("UNREAD");
+
+        if (isReadNow) {
+          await email.update({ is_read: true });
+          markedRead++;
+        } else {
+          stillUnread++;
+        }
+      } catch (error) {
+        failed++;
+      }
+    }
+
+    return {
+      checked: unreadEmails.length,
+      markedRead,
+      stillUnread,
+      failed
+    };
   },
 
   async getMails(req, res) {

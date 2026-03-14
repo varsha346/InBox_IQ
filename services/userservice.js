@@ -31,6 +31,16 @@ const userService = {
     return user;
   },
 
+  async getUserByEmailAddress(email) {
+    const user = await User.findOne({ where: { email } });
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    return user;
+  },
+
   async saveTokens(userId, tokens) {
     const user = await User.findByPk(userId);
 

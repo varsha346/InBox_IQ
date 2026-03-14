@@ -14,6 +14,11 @@ router.get("/email/:emailId", gmailService.getEmail);
 router.get("/emails/:userId/unread", gmailService.getUnread);
 router.get("/emails/:userId/search", gmailService.search);
 
+// ── Gmail Watch + Pub/Sub Webhook ────────────────────────────
+router.post("/watch/start/:userId", gmailService.startWatch);
+router.post("/watch/stop/:userId", gmailService.stopWatch);
+router.post("/watch/webhook", gmailService.pubsubWebhook);
+
 // ── Llama3 Priority Analysis ──────────────────────────────────
 // Analyze a single email with Llama3
 router.post("/analyze/:emailId", processingService.analyzeEmailRoute);
