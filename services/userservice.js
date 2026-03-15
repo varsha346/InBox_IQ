@@ -1,4 +1,5 @@
 const { User } = require("../models");
+const { encrypt, decrypt } = require("../utils/tokenCrypto");
 
 const userService = {
   async createOrUpdateGoogleUser(googleProfile) {
@@ -8,8 +9,18 @@ const userService = {
       where: { google_id: id }
     });
 
+    if (!user) {
+      user = await User.findOne({
+        where: { email }
+      });
+    }
+
     if (user) {
-      user = await user.update({ name, email });
+      user = await user.update({
+        name,
+        email,
+        google_id: id
+      });
     } else {
       user = await User.create({
         name,
@@ -41,6 +52,17 @@ const userService = {
     return user;
   },
 
+  /**
+   * Returns decrypted Gmail OAuth tokens from a user row.
+   * Call this wherever the raw token values are needed.
+   */
+  decryptTokens(user) {
+    return {
+      accessToken: decrypt(user.encrypted_access_token),
+      refreshToken: decrypt(user.encrypted_refresh_token)
+    };
+  },
+
   async saveTokens(userId, tokens) {
     const user = await User.findByPk(userId);
 
@@ -48,11 +70,16 @@ const userService = {
       throw new Error("User not found");
     }
 
-    return user.update({
-      encrypted_access_token: tokens.access_token,
-      encrypted_refresh_token: tokens.refresh_token,
+    // Only overwrite refresh_token when Google issues a new one
+    // (it is absent on subsequent refreshes to preserve the stored value)
+    const updateFields = {
+      encrypted_access_token: encrypt(tokens.access_token),
       token_expiry: tokens.expiry_date
-    });
+    };
+    if (tokens.refresh_token) {
+      updateFields.encrypted_refresh_token = encrypt(tokens.refresh_token);
+    }
+    return user.update(updateFields);
   },
 
   async create(req, res) {
@@ -180,34 +207,6 @@ const userService = {
     } catch (error) {
       return res.status(500).json({
         error: "Failed to update user"
-      });
-    }
-  },
-
-  async saveUserTokens(req, res) {
-    try {
-      const { userId } = req.params;
-      const { access_token, refresh_token, expiry_date } = req.body;
-
-      if (!access_token) {
-        return res.status(400).json({
-          error: "access_token is required"
-        });
-      }
-
-      const updatedUser = await userService.saveTokens(userId, {
-        access_token,
-        refresh_token,
-        expiry_date
-      });
-
-      return res.json({
-        message: "Tokens saved successfully",
-        data: updatedUser
-      });
-    } catch (error) {
-      return res.status(500).json({
-        error: "Failed to save tokens"
       });
     }
   },

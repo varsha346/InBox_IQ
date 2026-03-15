@@ -18,9 +18,12 @@
   },
   "homepage": "https://github.com/varsha346/InBox_IQ#readme",
   "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "googleapis": "^171.4.0",
+    "jsonwebtoken": "^9.0.3",
     "mysql2": "^3.19.0",
     "pg": "^8.19.0",
     "pg-hstore": "^2.3.4",

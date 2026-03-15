@@ -2,34 +2,34 @@ const express = require("express");
 const router = express.Router();
 const gmailService = require("../services/gmailservice");
 const processingService = require("../services/processingservice");
+const { authenticateToken } = require("../middlewares/authmiddleware");
 
-// ── Gmail Auth ────────────────────────────────────────────────
+// ── Gmail Auth (public – no token needed) ─────────────────────
 router.get("/login", gmailService.login);
 router.get("/google", gmailService.oauthCallback);
 
-// ── Email Fetching ────────────────────────────────────────────
-router.get("/fetch/:userId", gmailService.getNewMails);
-router.get("/emails/:userId", gmailService.getMails);
-router.get("/email/:emailId", gmailService.getEmail);
-router.get("/emails/:userId/unread", gmailService.getUnread);
-router.get("/emails/:userId/search", gmailService.search);
-
-// ── Gmail Watch + Pub/Sub Webhook ────────────────────────────
-router.post("/watch/start/:userId", gmailService.startWatch);
-router.post("/watch/stop/:userId", gmailService.stopWatch);
+// ── Pub/Sub Webhook (called by Google, not the user) ──────────
 router.post("/watch/webhook", gmailService.pubsubWebhook);
 
-// ── Llama3 Priority Analysis ──────────────────────────────────
-// Analyze a single email with Llama3
-router.post("/analyze/:emailId", processingService.analyzeEmailRoute);
+// ── Token Refresh (public – JWT may be expired, that's the point) ────
+router.post("/auth/refresh", gmailService.refreshAppToken);
 
-// Analyze all unprocessed emails for a user (?force=true to re-analyze all)
-router.post("/analyze/user/:userId", processingService.analyzeUserEmailsRoute);
+// ── Protected routes (JWT required) ──────────────────────────
+// Email Fetching
+router.get("/fetch/:userId", authenticateToken, gmailService.getNewMails);
+router.get("/emails/:userId", authenticateToken, gmailService.getMails);
+router.get("/email/:emailId", authenticateToken, gmailService.getEmail);
+router.get("/emails/:userId/unread", authenticateToken, gmailService.getUnread);
+router.get("/emails/:userId/search", authenticateToken, gmailService.search);
 
-// Get priority result for a single email
-router.get("/priority/:emailId", processingService.getPriorityRoute);
+// Gmail Watch
+router.post("/watch/start/:userId", authenticateToken, gmailService.startWatch);
+router.post("/watch/stop/:userId", authenticateToken, gmailService.stopWatch);
 
-// Get all emails sorted by priority score (optional ?label=URGENT|IMPORTANT|NORMAL|LOW)
-router.get("/emails/:userId/priority", processingService.getEmailsSortedByPriorityRoute);
+// Llama3 Priority Analysis
+router.post("/analyze/:emailId", authenticateToken, processingService.analyzeEmailRoute);
+router.post("/analyze/user/:userId", authenticateToken, processingService.analyzeUserEmailsRoute);
+router.get("/priority/:emailId", authenticateToken, processingService.getPriorityRoute);
+router.get("/emails/:userId/priority", authenticateToken, processingService.getEmailsSortedByPriorityRoute);
 
 module.exports = router;

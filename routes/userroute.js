@@ -1,13 +1,14 @@
 const express = require("express"); 
 const router = express.Router();
 const userService = require("../services/userservice");
+const { authenticateToken } = require("../middlewares/authmiddleware");
 
-router.post("/create", userService.create);
-router.get("/:userId", userService.getById);
-router.get("/email/:email", userService.getByEmail);
-router.get("/", userService.getAll);
-router.put("/:userId", userService.update);
-router.post("/:userId/tokens", userService.saveUserTokens);
-router.delete("/:userId", userService.delete);
+// All user management routes are protected
+router.post("/create", authenticateToken, userService.create);
+router.get("/email/:email", authenticateToken, userService.getByEmail);
+router.get("/", authenticateToken, userService.getAll);
+router.get("/:userId", authenticateToken, userService.getById);
+router.put("/:userId", authenticateToken, userService.update);
+router.delete("/:userId", authenticateToken, userService.delete);
 
 module.exports = router;

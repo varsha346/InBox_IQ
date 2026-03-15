@@ -2,10 +2,20 @@ const { google } = require("googleapis");
 const { Email } = require("../models");
 const userService = require("./userservice");
 const { Op } = require("sequelize");
+const jwt = require("jsonwebtoken");
 
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI;
+
+function setTokenCookie(res, token) {
+  res.cookie("token", token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+    maxAge: 7 * 24 * 60 * 60 * 1000
+  });
+}
 
 const SCOPES = [
   "https://www.googleapis.com/auth/gmail.readonly",
@@ -14,6 +24,68 @@ const SCOPES = [
 ];
 
 const gmailService = {
+  /**
+   * Issues a fresh JWT without requiring a new Google OAuth login.
+   * Verifies the user still has a valid Google refresh token stored in DB.
+   * Called when the client receives TOKEN_EXPIRED (401) from a protected route.
+   */
+  async refreshAppToken(req, res) {
+    try {
+      const { userId } = req.body;
+
+      if (!userId) {
+        return res.status(400).json({ error: "userId is required." });
+      }
+
+      const user = await userService.getUserById(userId);
+
+      if (!user.encrypted_refresh_token) {
+        return res.status(401).json({
+          error: "No Google refresh token on file. Please log in again via /gmail/login."
+        });
+      }
+
+      // Verify the Google refresh token is still valid
+      const { accessToken: at, refreshToken: rt } = userService.decryptTokens(user);
+      const oauth2Client = gmailService.createOAuthClient(
+        at,
+        rt,
+        user.token_expiry
+      );
+
+      let newGoogleTokens;
+      try {
+        const response = await oauth2Client.refreshAccessToken();
+        newGoogleTokens = response.credentials;
+      } catch (googleErr) {
+        return res.status(401).json({
+          error: "Google session has expired. Please log in again via /gmail/login.",
+          detail: googleErr.message
+        });
+      }
+
+      // Persist refreshed Google tokens
+      await userService.saveTokens(user.id, newGoogleTokens);
+
+      // Issue a fresh app JWT
+      const newJwt = jwt.sign(
+        { userId: user.id },
+        process.env.JWT_SECRET,
+        { expiresIn: "7d" }
+      );
+
+      setTokenCookie(res, newJwt);
+
+      return res.json({
+        message: "Token refreshed successfully.",
+        token: newJwt,
+        userId: user.id
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message || "Token refresh failed." });
+    }
+  },
+
   resolveTopicName(inputTopicName) {
     const raw = String(inputTopicName || "").trim().replace(/^['\"]|['\"]$/g, "");
     if (!raw) return null;
@@ -58,9 +130,10 @@ const gmailService = {
       throw error;
     }
 
+    const { accessToken, refreshToken } = userService.decryptTokens(user);
     const oauth2Client = gmailService.createOAuthClient(
-      user.encrypted_access_token,
-      user.encrypted_refresh_token,
+      accessToken,
+      refreshToken,
       user.token_expiry
     );
 
@@ -139,8 +212,18 @@ const gmailService = {
         tokens.expiry_date
       );
 
+      const jwtToken = jwt.sign(
+        { userId: user.id },
+        process.env.JWT_SECRET,
+        { expiresIn: "7d" }
+      );
+
+      setTokenCookie(res, jwtToken);
+
       return res.json({
         message: "Login successful",
+        token: jwtToken,
+        userId: user.id,
         emailsFetched: fetchResult.newEmails.length,
         unreadSync: fetchResult.unreadSync
       });
@@ -162,10 +245,11 @@ const gmailService = {
         });
       }
 
+      const { accessToken, refreshToken } = userService.decryptTokens(user);
       const fetchResult = await gmailService.fetchEmailsFromGmail(
         user.id,
-        user.encrypted_access_token,
-        user.encrypted_refresh_token,
+        accessToken,
+        refreshToken,
         user.token_expiry
       );
 
@@ -268,10 +352,11 @@ const gmailService = {
         });
       }
 
+      const { accessToken, refreshToken } = userService.decryptTokens(user);
       const fetchResult = await gmailService.fetchEmailsFromGmail(
         user.id,
-        user.encrypted_access_token,
-        user.encrypted_refresh_token,
+        accessToken,
+        refreshToken,
         user.token_expiry
       );
 
