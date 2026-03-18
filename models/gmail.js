@@ -16,7 +16,7 @@ module.exports = (sequelize, DataTypes) => {
     gmail_thread_id: DataTypes.STRING,
     subject: DataTypes.TEXT,
     snippet: DataTypes.TEXT,
-    body: DataTypes.TEXT,
+    body: DataTypes.TEXT("long"),
 
     sender_email: DataTypes.STRING,
     sender_name: DataTypes.STRING,

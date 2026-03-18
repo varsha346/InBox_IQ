@@ -6,27 +6,27 @@ const { DataTypes } = require("sequelize");
 const sequelize = require("../config/database");
 
 async function up(queryInterface) {
-  const table = await queryInterface.describeTable("users");
+  const table = await queryInterface.describeTable("email_priority");
 
-  if (!table.password_hash) {
-    await queryInterface.addColumn("users", "password_hash", {
-      type: DataTypes.STRING,
+  if (!table.mode) {
+    await queryInterface.addColumn("email_priority", "mode", {
+      type: DataTypes.ENUM("SYSTEM_DEFAULT", "USER_OVERRIDE"),
       allowNull: true
     });
-    console.log("Migration applied: added users.password_hash");
+    console.log("Migration applied: added email_priority.mode");
   } else {
-    console.log("Migration skipped: users.password_hash already exists");
+    console.log("Migration skipped: email_priority.mode already exists");
   }
 }
 
 async function down(queryInterface) {
-  const table = await queryInterface.describeTable("users");
+  const table = await queryInterface.describeTable("email_priority");
 
-  if (table.password_hash) {
-    await queryInterface.removeColumn("users", "password_hash");
-    console.log("Rollback applied: removed users.password_hash");
+  if (table.mode) {
+    await queryInterface.removeColumn("email_priority", "mode");
+    console.log("Rollback applied: removed email_priority.mode");
   } else {
-    console.log("Rollback skipped: users.password_hash does not exist");
+    console.log("Rollback skipped: email_priority.mode does not exist");
   }
 }
 

@@ -15,14 +15,23 @@ sequelize.sync().then(() => {
 });
 
 const gmailRoutes = require("./routes/gmailroute");
+const priorityRoutes = require("./routes/priorityroute");
+const processingRoutes = require("./routes/processingroute");
 const userRoutes = require("./routes/userroute");
 const authRoutes = require("./routes/authroute");
+
+// Backward-compatible alias for older clients still calling /google/login.
+app.get("/google/login", (req, res) => {
+  return res.redirect("/gmail/login");
+});
 
 // Mount OAuth callback directly at /login/oauth2/code/google (as per .env REDIRECT_URI)
 app.use("/login/oauth2/code", gmailRoutes);
 
 // Mount other Gmail routes
 app.use("/gmail", gmailRoutes);
+app.use("/priority", priorityRoutes);
+app.use("/processing", processingRoutes);
 app.use("/users", userRoutes);
 app.use("/auth", authRoutes);
 

@@ -25,6 +25,14 @@ module.exports = (sequelize, DataTypes) => {
 
     reason: DataTypes.TEXT,
 
+    mode: {
+      type: DataTypes.ENUM(
+        "SYSTEM_DEFAULT",
+        "USER_OVERRIDE"
+      ),
+      allowNull: true
+    },
+
     processed_at: DataTypes.DATE
 
   }, {

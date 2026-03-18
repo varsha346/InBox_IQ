@@ -6,27 +6,28 @@ const { DataTypes } = require("sequelize");
 const sequelize = require("../config/database");
 
 async function up(queryInterface) {
-  const table = await queryInterface.describeTable("users");
+  const table = await queryInterface.describeTable("emails");
 
-  if (!table.password_hash) {
-    await queryInterface.addColumn("users", "password_hash", {
-      type: DataTypes.STRING,
+  if (table.body && table.body.type !== "LONGTEXT") {
+    await queryInterface.changeColumn("emails", "body", {
+      type: DataTypes.TEXT("long"),
       allowNull: true
     });
-    console.log("Migration applied: added users.password_hash");
+    console.log("Migration applied: altered emails.body to LONGTEXT");
   } else {
-    console.log("Migration skipped: users.password_hash already exists");
+    console.log("Migration skipped: emails.body is already LONGTEXT or does not exist");
   }
 }
 
 async function down(queryInterface) {
-  const table = await queryInterface.describeTable("users");
+  const table = await queryInterface.describeTable("emails");
 
-  if (table.password_hash) {
-    await queryInterface.removeColumn("users", "password_hash");
-    console.log("Rollback applied: removed users.password_hash");
-  } else {
-    console.log("Rollback skipped: users.password_hash does not exist");
+  if (table.body) {
+    await queryInterface.changeColumn("emails", "body", {
+      type: DataTypes.TEXT,
+      allowNull: true
+    });
+    console.log("Rollback applied: reverted emails.body to TEXT");
   }
 }
 

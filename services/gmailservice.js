@@ -1,12 +1,65 @@
 const { google } = require("googleapis");
-const { Email } = require("../models");
+const { Email, Label } = require("../models");
 const userService = require("./userservice");
+const priorityService = require("./priorityservice");
+const sseService = require("./sseservice");
 const { Op } = require("sequelize");
 const jwt = require("jsonwebtoken");
 
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI;
+
+function decodeHtmlEntities(text) {
+  if (!text || typeof text !== "string") return "";
+
+  const namedEntities = {
+    amp: "&",
+    apos: "'",
+    gt: ">",
+    lt: "<",
+    nbsp: " ",
+    quot: '"'
+  };
+
+  return text.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => {
+    const normalizedEntity = entity.toLowerCase();
+
+    if (normalizedEntity[0] === "#") {
+      const isHex = normalizedEntity[1] === "x";
+      const numericValue = Number.parseInt(
+        normalizedEntity.slice(isHex ? 2 : 1),
+        isHex ? 16 : 10
+      );
+
+      return Number.isNaN(numericValue) ? match : String.fromCodePoint(numericValue);
+    }
+
+    return namedEntities[normalizedEntity] || match;
+  });
+}
+
+function htmlToReadableText(html) {
+  if (!html || typeof html !== "string") return "";
+
+  const normalizedText = html
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>|<\/div>|<\/section>|<\/article>|<\/h[1-6]>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "- ")
+    .replace(/<\/li>|<\/tr>/gi, "\n")
+    .replace(/<\/td>|<\/th>/gi, "\t")
+    .replace(/<[^>]+>/g, " ");
+
+  return decodeHtmlEntities(normalizedText)
+    .replace(/\r/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n[ \t]+/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 function setTokenCookie(res, token) {
   res.cookie("token", token, {
@@ -145,6 +198,35 @@ const gmailService = {
     return { user, gmail };
   },
 
+  async streamUserEmails(req, res) {
+    const { userId } = req.params;
+
+    if (String(userId) !== String(req.userId)) {
+      return res.status(403).json({ error: "Forbidden: you can only stream your own emails." });
+    }
+
+    sseService.initStreamHeaders(res);
+
+    const streamUserId = String(userId);
+    const clientId = sseService.addClient(streamUserId, res);
+
+    sseService.sendEvent(res, "connected", {
+      message: "SSE connected",
+      clientId,
+      userId: streamUserId,
+      connectedAt: new Date().toISOString()
+    });
+
+    const heartbeat = setInterval(() => {
+      sseService.sendComment(res, "heartbeat");
+    }, 25000);
+
+    req.on("close", () => {
+      clearInterval(heartbeat);
+      sseService.removeClient(streamUserId, clientId);
+    });
+  },
+
   async login(req, res) {
     try {
       const oauth2Client = new google.auth.OAuth2(
@@ -215,7 +297,7 @@ const gmailService = {
       const jwtToken = jwt.sign(
         { userId: user.id },
         process.env.JWT_SECRET,
-        { expiresIn: "7d" }
+        { expiresIn: "1h" }
       );
 
       setTokenCookie(res, jwtToken);
@@ -225,7 +307,8 @@ const gmailService = {
         token: jwtToken,
         userId: user.id,
         emailsFetched: fetchResult.newEmails.length,
-        unreadSync: fetchResult.unreadSync
+        unreadSync: fetchResult.unreadSync,
+        prioritySync: fetchResult.prioritySync
       });
     } catch (error) {
       return res.status(500).json({
@@ -257,7 +340,8 @@ const gmailService = {
         message: "Emails fetched successfully",
         count: fetchResult.newEmails.length,
         emails: fetchResult.newEmails,
-        unreadSync: fetchResult.unreadSync
+        unreadSync: fetchResult.unreadSync,
+        prioritySync: fetchResult.prioritySync
       });
     } catch (error) {
       return res.status(500).json({
@@ -365,6 +449,7 @@ const gmailService = {
         emailAddress,
         newEmails: fetchResult.newEmails.length,
         unreadSync: fetchResult.unreadSync,
+        prioritySync: fetchResult.prioritySync,
         historyId: notification.historyId || null
       });
     } catch (error) {
@@ -395,6 +480,67 @@ const gmailService = {
     const messages = listResponse.data.messages || [];
     const savedEmails = [];
 
+    function decodeBase64Url(data) {
+      if (!data || typeof data !== "string") return "";
+
+      const normalized = data.replace(/-/g, "+").replace(/_/g, "/");
+      const padding = normalized.length % 4;
+      const padded = padding ? normalized + "=".repeat(4 - padding) : normalized;
+
+      try {
+        return Buffer.from(padded, "base64").toString("utf8");
+      } catch {
+        return "";
+      }
+    }
+
+    function collectBodyParts(part, accumulator) {
+      if (!part) return;
+
+      if (part.mimeType === "text/plain" && part.body?.data) {
+        accumulator.plain.push(decodeBase64Url(part.body.data));
+      }
+
+      if (part.mimeType === "text/html" && part.body?.data) {
+        accumulator.html.push(decodeBase64Url(part.body.data));
+      }
+
+      if (Array.isArray(part.parts)) {
+        for (const child of part.parts) {
+          collectBodyParts(child, accumulator);
+        }
+      }
+    }
+
+    function extractMessageBodies(payload, snippet) {
+      const pieces = { plain: [], html: [] };
+      collectBodyParts(payload, pieces);
+
+      const plainBody = pieces.plain.join("\n\n").trim();
+      const htmlBody = pieces.html.join("\n\n").trim();
+      const topLevelBody = decodeBase64Url(payload?.body?.data || "").trim();
+      const topLevelPlainBody = payload?.mimeType === "text/plain" ? topLevelBody : "";
+      const topLevelHtmlBody = payload?.mimeType === "text/html" ? topLevelBody : "";
+      const normalizedHtmlBody = htmlBody || topLevelHtmlBody || "";
+      const derivedPlainBody = htmlToReadableText(normalizedHtmlBody);
+      const normalizedPlainBody = plainBody || topLevelPlainBody || derivedPlainBody || snippet || "";
+      const preferredBody = normalizedPlainBody || normalizedHtmlBody || snippet || "";
+
+      return preferredBody;
+    }
+
+    async function syncLabelsForEmail(emailRecord, labelIds) {
+      const uniqueLabels = [...new Set((labelIds || []).filter(Boolean))];
+      const labelRecords = [];
+
+      for (const labelName of uniqueLabels) {
+        const [label] = await Label.findOrCreate({ where: { name: labelName } });
+        labelRecords.push(label);
+      }
+
+      await emailRecord.setLabels(labelRecords);
+    }
+
     for (const message of messages) {
       const msg = await gmail.users.messages.get({
         userId: "me",
@@ -410,6 +556,7 @@ const gmailService = {
       const date = headers.find((h) => h.name === "Date")?.value || "";
       const snippet = msg.data.snippet || "";
       const labels = msg.data.labelIds || [];
+      const body = extractMessageBodies(payload, snippet);
 
       const fromMatch = from.match(/^(.*?)\s*<(.+?)>$|^(.+?)$/);
       const senderName = fromMatch ? (fromMatch[1] || fromMatch[3] || "") : "";
@@ -424,12 +571,15 @@ const gmailService = {
           gmail_thread_id: msg.data.threadId,
           subject,
           snippet,
+          body,
           sender_email: senderEmail,
           sender_name: senderName,
           received_at: date ? new Date(date) : null,
           is_read: !labels.includes("UNREAD"),
           gmail_link: `https://mail.google.com/mail/u/0/#inbox/${message.id}`
         });
+
+        await syncLabelsForEmail(exists, labels);
         continue;
       }
 
@@ -439,6 +589,7 @@ const gmailService = {
         gmail_thread_id: msg.data.threadId,
         subject,
         snippet,
+        body,
         sender_email: senderEmail,
         sender_name: senderName,
         received_at: date ? new Date(date) : null,
@@ -447,14 +598,51 @@ const gmailService = {
         gmail_link: `https://mail.google.com/mail/u/0/#inbox/${message.id}`
       });
 
+      await syncLabelsForEmail(email, labels);
+
       savedEmails.push(email);
     }
 
     const unreadSync = await gmailService.syncUnreadStatuses(userId, gmail);
 
+    const prioritySync = {
+      attempted: savedEmails.length,
+      analyzed: 0,
+      failed: 0
+    };
+
+    for (const emailRecord of savedEmails) {
+      try {
+        const outcome = await priorityService.analyzeEmail(emailRecord.id, { userInput: "" });
+        if (outcome.success) {
+          prioritySync.analyzed++;
+        } else {
+          prioritySync.failed++;
+        }
+      } catch (error) {
+        prioritySync.failed++;
+      }
+    }
+
+    if (savedEmails.length > 0) {
+      const payloadEmails = savedEmails.map((email) => (
+        typeof email.toJSON === "function" ? email.toJSON() : email
+      ));
+
+      sseService.broadcastToUser(String(userId), "new_emails", {
+        userId,
+        count: payloadEmails.length,
+        emails: payloadEmails,
+        unreadSync,
+        prioritySync,
+        emittedAt: new Date().toISOString()
+      });
+    }
+
     return {
       newEmails: savedEmails,
-      unreadSync
+      unreadSync,
+      prioritySync
     };
   },
 
