@@ -153,14 +153,26 @@ const processingService = {
 
             const where = { user_id: userId };
 
+            const includeOpts = {
+                model: EmailPriority,
+                required: false // LEFT JOIN — show emails even without priority
+            };
+            if (label) {
+                includeOpts.where = { priority_label: label };
+                includeOpts.required = true; // filter needs INNER JOIN
+            }
+
             const emails = await Email.findAll({
                 where,
-                include: [{
-                    model: EmailPriority,
-                    required: true,
-                    where: label ? { priority_label: label } : {}
-                }],
-                order: [[EmailPriority, "priority_score", "DESC"]]
+                include: [includeOpts],
+                order: [["received_at", "DESC"]]
+            });
+
+            // Sort: prioritized emails first (by score desc), then un-prioritized
+            emails.sort((a, b) => {
+                const scoreA = a.EmailPriority ? a.EmailPriority.priority_score : -1;
+                const scoreB = b.EmailPriority ? b.EmailPriority.priority_score : -1;
+                return scoreB - scoreA;
             });
 
             return res.json({
@@ -173,13 +185,16 @@ const processingService = {
                     received_at: e.received_at,
                     snippet: e.snippet,
                     gmail_link: e.gmail_link,
-                    priority: {
-                        label: e.EmailPriority.priority_label,
-                        score: e.EmailPriority.priority_score,
-                        confidence: e.EmailPriority.confidence,
-                        reason: e.EmailPriority.reason,
-                        processed_at: e.EmailPriority.processed_at
-                    }
+                    is_read: e.is_read,
+                    priority: e.EmailPriority
+                        ? {
+                            label: e.EmailPriority.priority_label,
+                            score: e.EmailPriority.priority_score,
+                            confidence: e.EmailPriority.confidence,
+                            reason: e.EmailPriority.reason,
+                            processed_at: e.EmailPriority.processed_at
+                        }
+                        : null
                 }))
             });
         } catch (error) {

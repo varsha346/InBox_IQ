@@ -1,33 +1,119 @@
 const { EmailPriority } = require("../models");
 
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://localhost:11434";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2:1b";
 
-const PRIORITY_PROMPT = (subject, snippet, sender) => `You are an email classifier. Read the email below and pick ONE priority label.
+// ─── Rule-based pre-classifier ───────────────────────────────────────────────
+// Catches obvious cases BEFORE calling the LLM so the small model can't
+// misclassify them. Returns a priority result or null (= let LLM decide).
+function ruleBasedClassify(subject, snippet, sender) {
+    const s   = (subject || "").toLowerCase();
+    const snip = (snippet || "").toLowerCase();
+    const from = (sender  || "").toLowerCase();
+    const all  = `${s} ${snip} ${from}`;
 
-EMAIL:
+    // ── ALWAYS LOW ──────────────────────────────────────────────────────────
+    const lowSenderPatterns = [
+        "linkedin.com", "noreply@", "no-reply@", "newsletter",
+        "marketing", "promo", "notifications@", "invitations@linkedin",
+        "mailer", "beehiiv", "substack", "medium.com", "quora.com",
+        "facebook.com", "facebookmail.com", "twitter.com", "x.com",
+        "instagram.com", "discord.com", "reddit.com"
+    ];
+    const lowSubjectPatterns = [
+        "invitation to connect", "accepted your invitation",
+        "explore their network", "who viewed your profile",
+        "hiring alert", "job alert", "unsubscribe",
+        "new follower", "liked your", "commented on your",
+        "trending on", "digest", "weekly roundup"
+    ];
+
+    if (lowSenderPatterns.some(p => from.includes(p))) {
+        return {
+            priority_label: "LOW",
+            priority_score: 0.15,
+            confidence: 0.98,
+            reason: "Automated notification / social media (rule-based)"
+        };
+    }
+    if (lowSubjectPatterns.some(p => s.includes(p))) {
+        return {
+            priority_label: "LOW",
+            priority_score: 0.15,
+            confidence: 0.95,
+            reason: "Social / promotional subject pattern (rule-based)"
+        };
+    }
+
+    // ── ALWAYS IMPORTANT ────────────────────────────────────────────────────
+    const importantPatterns = [
+        "hall ticket", "hallticket", "admit card", "admitcard",
+        "exam schedule", "examination", "seat number",
+        "result declared", "results announced", "marksheet",
+        "deadline", "due date", "payment due", "bill due",
+        "action required", "response required", "reply needed",
+        "password reset", "verify your account", "otp",
+        "interview scheduled", "offer letter"
+    ];
+
+    if (importantPatterns.some(p => all.includes(p))) {
+        return {
+            priority_label: "IMPORTANT",
+            priority_score: 0.75,
+            confidence: 0.95,
+            reason: "Exam / deadline / action-required email (rule-based)"
+        };
+    }
+
+    // ── ALWAYS URGENT ───────────────────────────────────────────────────────
+    const urgentPatterns = [
+        "account compromised", "unauthorized login", "security breach",
+        "payment failed", "legal notice", "server down", "system outage",
+        "medical emergency"
+    ];
+
+    if (urgentPatterns.some(p => all.includes(p))) {
+        return {
+            priority_label: "URGENT",
+            priority_score: 0.95,
+            confidence: 0.95,
+            reason: "Security / emergency alert (rule-based)"
+        };
+    }
+
+    return null; // no rule matched → let LLM decide
+}
+
+// ─── LLM prompt (simplified for 1B model) ───────────────────────────────────
+const PRIORITY_PROMPT = (subject, snippet, sender) => `Classify this email into ONE priority label.
+
 From: ${sender}
 Subject: ${subject}
 Preview: ${snippet}
 
-LABEL DEFINITIONS (pick exactly one):
-- LOW: newsletters, promotions, social media, marketing, bulk emails, notifications you did not request
-- NORMAL: regular updates, receipts, confirmations, general info emails, newsletters you care about
-- IMPORTANT: work tasks, meetings, bills, deadlines, emails that need a reply soon
-- URGENT: server down, security breach, payment failed, legal issue, medical emergency, anything needing action RIGHT NOW
+Labels (pick exactly one):
+- LOW: spam, ads, social media notifications, newsletters, LinkedIn, promotions, job alerts, bulk mail
+- NORMAL: receipts, order updates, general info, routine announcements, FYI emails
+- IMPORTANT: hall tickets, admit cards, exam results, deadlines, bills, meeting invites from real people, personal emails needing a reply
+- URGENT: security breaches, payment failures, legal notices, system outages, medical emergencies
 
-STEP 1: Is this a promotion, newsletter, or marketing email? If yes → LOW
-STEP 2: Is this a routine update, receipt, or confirmation? If yes → NORMAL  
-STEP 3: Does this need a reply or action within a day or two? If yes → IMPORTANT
-STEP 4: Does this need action within the next hour? If yes → URGENT
-
-Reply with ONLY this JSON (no extra text, no explanation):
-{"priority_label":"<LOW or NORMAL or IMPORTANT or URGENT>","priority_score":<0.1 to 1.0>,"confidence":<0.1 to 1.0>,"reason":"<one short sentence>"}`;
+Reply ONLY with valid JSON:
+{"priority_label":"LOW or NORMAL or IMPORTANT or URGENT","priority_score":0.5,"confidence":0.8,"reason":"short reason"}`;
 
 
 const priorityService = {
 
+    // Main analysis entry point — tries rules first, falls back to LLM
     async analyzeWithLlama(subject, snippet, sender) {
+        // 1. Try deterministic rules first
+        const ruleResult = ruleBasedClassify(subject, snippet, sender);
+        if (ruleResult) {
+            console.log(`[Priority] Rule-based → ${ruleResult.priority_label} | "${subject}"`);
+            return ruleResult;
+        }
+
+        // 2. Fall back to LLM
+        console.log(`[Priority] Calling LLM for: "${subject}"`);
         const prompt = PRIORITY_PROMPT(subject || "", snippet || "", sender || "");
 
         const response = await fetch(`${OLLAMA_URL}/api/generate`, {
@@ -37,15 +123,22 @@ const priorityService = {
                 model: OLLAMA_MODEL,
                 prompt,
                 stream: false,
-                format: "json"
+                format: "json",
+                options: { num_gpu: 0 }  // Force CPU to avoid CUDA out-of-memory
             })
         });
 
         if (!response.ok) {
-            throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
+            const errBody = await response.text().catch(() => "");
+            throw new Error(`Ollama API error: ${response.status} ${response.statusText} — ${errBody}`);
         }
 
+        // Check for error in response body (Ollama returns 200 with error field)
         const data = await response.json();
+        if (data.error) {
+            throw new Error(`Ollama model error: ${data.error}`);
+        }
+
         const raw = data.response?.trim();
 
         let parsed;

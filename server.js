@@ -1,8 +1,18 @@
 require("dotenv").config();
 const express = require("express");
 const { sequelize } = require("./models");
+const cors = require("cors");
 
 const app = express();
+<<<<<<< Updated upstream
+=======
+
+app.use(cors({
+  origin: "http://localhost:5173",
+  credentials: true
+}));
+app.use(cookieParser());
+>>>>>>> Stashed changes
 
 // Only parse JSON for POST, PUT, PATCH requests
 app.use((req, res, next) => {
