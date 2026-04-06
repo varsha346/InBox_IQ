@@ -27,10 +27,13 @@ function extractTokenFromCookieHeader(cookieHeader) {
 function authenticateToken(req, res, next) {
   const cookieToken = req.cookies?.token || req.cookies?.jwt || req.cookies?.access_token || null;
   const headerToken = extractTokenFromCookieHeader(req.headers?.cookie);
-  const token = cookieToken || headerToken;
+  const queryToken = req.query?.token || null;
+  const token = cookieToken || headerToken || queryToken;
   const debugEnabled = String(process.env.AUTH_DEBUG || "").toLowerCase() === "true";
+  console.log(`[authenticateToken] Route: ${req.method} ${req.path}, hasToken: ${Boolean(token)}, cookies: ${JSON.stringify(Object.keys(req.cookies || {}))}, queryToken: ${Boolean(queryToken)}`);
 
   if (!token) {
+    console.log(`[authenticateToken] No token found, rejecting with 401`);
     return res.status(401).json({
       error: "Access denied. No token provided.",
       ...(debugEnabled
@@ -45,6 +48,7 @@ function authenticateToken(req, res, next) {
   }
 
   if (!JWT_SECRET) {
+    console.log(`[authenticateToken] JWT_SECRET not set, rejecting with 500`);
     return res.status(500).json({ error: "Server misconfiguration: JWT_SECRET not set." });
   }
 

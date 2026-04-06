@@ -24,6 +24,6 @@ GCP_PROJECT_ID=
 
 # ========== EMAIL PRIORITY LLM (OpenRouter) ==========
 OPENROUTER_API_KEY=
-OPENROUTER_MODEL=openrouter/hunter-alpha
+OPENROUTER_MODEL=xiaomi/mimo-v2-pro
 OPENROUTER_FALLBACK_ON_ERROR=false
 PRIORITY_USE_SNIPPET_ONLY=true

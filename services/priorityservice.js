@@ -1,13 +1,37 @@
 const { Email, EmailPriority } = require("../models");
+const { Op } = require("sequelize");
 const processingService = require("./processingservice");
 
 // ========== CONFIG ==========
 const OPENROUTER_API_KEY = String(process.env.OPENROUTER_API_KEY || "").trim();
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openrouter/hunter-alpha";
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "xiaomi/mimo-v2-pro";
 const OPENROUTER_FALLBACK_ON_ERROR = String(process.env.OPENROUTER_FALLBACK_ON_ERROR || "false").toLowerCase() === "true";
 const PRIORITY_USE_SNIPPET_ONLY = String(process.env.PRIORITY_USE_SNIPPET_ONLY || "true").toLowerCase() === "true";
 const VALID_LABELS = ["LOW", "NORMAL", "IMPORTANT", "URGENT"];
 const MAX_TEXT_LENGTH = 4000;
+const DEFAULT_RECENT_DAYS = Number(process.env.RECENT_EMAIL_DAYS || 2);
+const DEFAULT_RECENT_LIMIT = Number(process.env.RECENT_EMAIL_LIMIT || 25);
+
+function normalizeRecentDays(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_RECENT_DAYS;
+    return Math.min(Math.floor(parsed), 14);
+}
+
+function normalizeRecentLimit(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_RECENT_LIMIT;
+    return Math.min(Math.floor(parsed), 100);
+}
+
+function buildRecentWhereClause(userId, recentDays) {
+    const since = new Date(Date.now() - normalizeRecentDays(recentDays) * 24 * 60 * 60 * 1000);
+
+    return {
+        user_id: userId,
+        received_at: { [Op.gte]: since }
+    };
+}
 
 function cleanText(value, maxLength = MAX_TEXT_LENGTH) {
     return String(value || "")
@@ -91,14 +115,32 @@ function parseJsonObject(raw) {
 }
 
 function normalizeModelResult(parsed) {
-    const label = String(parsed.priority_label || "").trim().toUpperCase();
+    const rawLabel = String(parsed.priority_label || "").trim().toUpperCase();
+    const labelAliases = {
+        MEDIUM: "NORMAL",
+        HIGH: "IMPORTANT",
+        CRITICAL: "URGENT",
+        VERY_HIGH: "URGENT"
+    };
+
+    const label = labelAliases[rawLabel] || rawLabel;
+
     if (!VALID_LABELS.includes(label)) {
         throw new Error(`Invalid priority_label from model: ${parsed.priority_label}`);
     }
 
-    const rawScore = Number(parsed.priority_score);
-    const rawConfidence = Number(parsed.confidence);
+    let rawScore = Number(parsed.priority_score);
+    let rawConfidence = Number(parsed.confidence);
     const reason = String(parsed.reason || "").trim();
+
+    // Some providers return 0-100 scores; normalize to 0-1 while preserving model output meaning.
+    if (Number.isFinite(rawScore) && rawScore > 1 && rawScore <= 100) {
+        rawScore = rawScore / 100;
+    }
+
+    if (Number.isFinite(rawConfidence) && rawConfidence > 1 && rawConfidence <= 100) {
+        rawConfidence = rawConfidence / 100;
+    }
 
     if (Number.isNaN(rawScore) || Number.isNaN(rawConfidence)) {
         throw new Error("Model returned non-numeric priority_score or confidence.");
@@ -199,10 +241,27 @@ async function buildOpenRouterError(response) {
 
 const priorityService = {
 
+    async getAnalysisHealthRoute(req, res) {
+        return res.json({
+            ok: true,
+            provider: "openrouter",
+            model: OPENROUTER_MODEL,
+            hasApiKey: Boolean(OPENROUTER_API_KEY),
+            fallbackOnError: OPENROUTER_FALLBACK_ON_ERROR,
+            useSnippetOnly: PRIORITY_USE_SNIPPET_ONLY,
+            recentDefaults: {
+                days: DEFAULT_RECENT_DAYS,
+                limit: DEFAULT_RECENT_LIMIT
+            },
+            timestamp: new Date().toISOString()
+        });
+    },
+
     async analyzeEmailRoute(req, res) {
         try {
             const { emailId } = req.params;
             const email = await processingService.resolveEmailById(emailId);
+            const userInput = processingService.normalizeUserInput(req.body?.userInput);
 
             if (!email) {
                 return res.status(404).json({ error: "Email not found" });
@@ -212,7 +271,6 @@ const priorityService = {
                 return res.status(403).json({ error: "Forbidden: you can only analyze your own emails." });
             }
 
-            const userInput = processingService.normalizeUserInput(req.body?.userInput);
             const result = await priorityService.analyzeEmail(emailId, { userInput });
 
             if (!result.success) {
@@ -230,14 +288,16 @@ const priorityService = {
             const { userId } = req.params;
             const force = req.query.force === "true";
             const userInput = processingService.normalizeUserInput(req.body?.userInput);
+            const recentDays = normalizeRecentDays(req.body?.days);
+            const recentLimit = normalizeRecentLimit(req.body?.limit);
 
             if (String(userId) !== String(req.userId)) {
                 return res.status(403).json({ error: "Forbidden: you can only analyze your own emails." });
             }
 
             const results = force
-                ? await priorityService.reanalyzeAll(userId, { userInput })
-                : await priorityService.analyzeAllPending(userId, { userInput });
+                ? await priorityService.reanalyzeAll(userId, { userInput, days: recentDays, limit: recentLimit })
+                : await priorityService.analyzeAllPending(userId, { userInput, days: recentDays, limit: recentLimit });
 
             return res.json({
                 message: "Analysis complete",
@@ -245,7 +305,11 @@ const priorityService = {
                 failed: results.failed,
                 skipped: results.skipped || 0,
                 quotaExceeded: Boolean(results.quotaExceeded),
-                errorSummary: results.errorSummary || null
+                errorSummary: results.errorSummary || null,
+                sampleErrors: (results.details || [])
+                    .filter((item) => item && item.success === false)
+                    .slice(0, 3)
+                    .map((item) => ({ emailId: item.emailId, error: item.error }))
             });
         } catch (error) {
             return res.status(500).json({ error: error.message });
@@ -256,12 +320,18 @@ const priorityService = {
         try {
             const { userId } = req.params;
             const userInput = processingService.normalizeUserInput(req.body?.userInput);
+            const recentDays = normalizeRecentDays(req.body?.days);
+            const recentLimit = normalizeRecentLimit(req.body?.limit);
 
             if (String(userId) !== String(req.userId)) {
                 return res.status(403).json({ error: "Forbidden: you can only analyze your own emails." });
             }
 
-            const results = await priorityService.reanalyzeAll(userId, { userInput });
+            const results = await priorityService.reanalyzeAll(userId, {
+                userInput,
+                days: recentDays,
+                limit: recentLimit
+            });
 
             return res.json({
                 message: "Reanalysis complete",
@@ -269,7 +339,11 @@ const priorityService = {
                 failed: results.failed,
                 skipped: results.skipped || 0,
                 quotaExceeded: Boolean(results.quotaExceeded),
-                errorSummary: results.errorSummary || null
+                errorSummary: results.errorSummary || null,
+                sampleErrors: (results.details || [])
+                    .filter((item) => item && item.success === false)
+                    .slice(0, 3)
+                    .map((item) => ({ emailId: item.emailId, error: item.error }))
             });
         } catch (error) {
             return res.status(500).json({ error: error.message });
@@ -280,19 +354,80 @@ const priorityService = {
         try {
             const { userId } = req.params;
             const { label } = req.query;
+            const recentDays = normalizeRecentDays(req.query?.days);
+            const recentLimit = normalizeRecentLimit(req.query?.limit);
 
             if (String(userId) !== String(req.userId)) {
                 return res.status(403).json({ error: "Forbidden: you can only access your own emails." });
             }
 
             const emails = await Email.findAll({
-                where: { user_id: userId },
+                where: buildRecentWhereClause(userId, recentDays),
                 include: [{
                     model: EmailPriority,
                     required: true,
                     where: label ? { priority_label: label } : {}
                 }],
-                order: [[EmailPriority, "priority_score", "DESC"]]
+                order: [[EmailPriority, "priority_score", "DESC"], ["received_at", "DESC"]],
+                limit: recentLimit
+            });
+
+            return res.json({
+                total: emails.length,
+                emails: emails.map((email) => ({
+                    id: email.id,
+                    subject: email.subject,
+                    sender_email: email.sender_email,
+                    sender_name: email.sender_name,
+                    received_at: email.received_at,
+                    snippet: email.snippet,
+                    gmail_link: email.gmail_link,
+                    priority: {
+                        label: email.EmailPriority.priority_label,
+                        score: email.EmailPriority.priority_score,
+                        confidence: email.EmailPriority.confidence,
+                        reason: email.EmailPriority.reason,
+                        mode: email.EmailPriority.mode,
+                        processed_at: email.EmailPriority.processed_at
+                    }
+                }))
+            });
+        } catch (error) {
+            return res.status(500).json({ error: error.message });
+        }
+    },
+
+    async searchUserEmailsRoute(req, res) {
+        try {
+            const { userId } = req.params;
+            const query = String(req.query?.q || "").trim();
+            const recentDays = normalizeRecentDays(req.query?.days);
+            const recentLimit = normalizeRecentLimit(req.query?.limit);
+
+            if (String(userId) !== String(req.userId)) {
+                return res.status(403).json({ error: "Forbidden: you can only access your own emails." });
+            }
+
+            if (!query) {
+                return res.status(400).json({ error: "Search query `q` is required." });
+            }
+
+            const recentWhere = buildRecentWhereClause(userId, recentDays);
+            const emails = await Email.findAll({
+                where: {
+                    ...recentWhere,
+                    [Op.or]: [
+                        { subject: { [Op.like]: `%${query}%` } },
+                        { snippet: { [Op.like]: `%${query}%` } },
+                        { sender_email: { [Op.like]: `%${query}%` } }
+                    ]
+                },
+                include: [{
+                    model: EmailPriority,
+                    required: true
+                }],
+                order: [[EmailPriority, "priority_score", "DESC"], ["received_at", "DESC"]],
+                limit: recentLimit
             });
 
             return res.json({
@@ -368,6 +503,7 @@ const priorityService = {
                     content: prompt
                 }],
                 temperature: 0.2,
+                max_tokens: 256,
                 response_format: { type: "json_object" }
             })
         });
@@ -463,12 +599,17 @@ const priorityService = {
 
     async analyzeAllPending(userId, options = {}) {
         const normalizedUserId = normalizeUserIdInput(userId);
+        const recentDays = normalizeRecentDays(options.days);
+        const recentLimit = normalizeRecentLimit(options.limit);
+
         const emails = await Email.findAll({
-            where: { user_id: normalizedUserId },
+            where: buildRecentWhereClause(normalizedUserId, recentDays),
             include: [{
                 model: EmailPriority,
                 required: false
-            }]
+            }],
+            order: [["received_at", "DESC"]],
+            limit: recentLimit
         });
 
         const unprocessed = emails.filter((email) => !email.EmailPriority);
@@ -496,6 +637,10 @@ const priorityService = {
 
         if (!results.quotaExceeded) {
             results.skipped = alreadyAnalyzedCount;
+            if (!results.errorSummary && results.failed > 0) {
+                const firstFailure = results.details.find((item) => item && item.success === false);
+                results.errorSummary = firstFailure?.error || "Analysis failed for one or more emails.";
+            }
         }
         return results;
     },
@@ -503,7 +648,14 @@ const priorityService = {
     async reanalyzeAll(userId, options = {}) {
         const normalizedUserId = normalizeUserIdInput(userId);
         const safeOptions = options && typeof options === "object" && !options.statusCode ? options : {};
-        const emails = await Email.findAll({ where: { user_id: normalizedUserId } });
+        const recentDays = normalizeRecentDays(safeOptions.days);
+        const recentLimit = normalizeRecentLimit(safeOptions.limit);
+
+        const emails = await Email.findAll({
+            where: buildRecentWhereClause(normalizedUserId, recentDays),
+            order: [["received_at", "DESC"]],
+            limit: recentLimit
+        });
         const results = { analyzed: 0, failed: 0, skipped: 0, details: [], quotaExceeded: false, errorSummary: null };
 
         for (let index = 0; index < emails.length; index++) {
@@ -523,6 +675,11 @@ const priorityService = {
                 }
             }
             results.details.push(outcome);
+        }
+
+        if (!results.errorSummary && results.failed > 0) {
+            const firstFailure = results.details.find((item) => item && item.success === false);
+            results.errorSummary = firstFailure?.error || "Reanalysis failed for one or more emails.";
         }
 
         return results;

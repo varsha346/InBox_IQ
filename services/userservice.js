@@ -1,7 +1,24 @@
 const { User } = require("../models");
 const { encrypt, decrypt } = require("../utils/tokenCrypto");
 
+/**
+ * Returns a clean profile object without sensitive data
+ */
+function getCleanProfile(user) {
+  if (!user) return null;
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    google_id: user.google_id || null,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt
+  };
+}
+
 const userService = {
+  getCleanProfile,
+
   async createOrUpdateGoogleUser(googleProfile) {
     const { id, email, name } = googleProfile;
 
@@ -108,7 +125,7 @@ const userService = {
 
       return res.status(201).json({
         message: "User created successfully",
-        data: user
+        data: getCleanProfile(user)
       });
     } catch (error) {
       return res.status(500).json({
@@ -124,11 +141,11 @@ const userService = {
 
       return res.json({
         message: "User retrieved successfully",
-        data: user
+        data: getCleanProfile(user)
       });
     } catch (error) {
-      return res.status(500).json({
-        error: "Failed to fetch user"
+      return res.status(404).json({
+        error: error.message || "Failed to fetch user"
       });
     }
   },
@@ -147,7 +164,7 @@ const userService = {
 
       return res.json({
         message: "User retrieved successfully",
-        data: user
+        data: getCleanProfile(user)
       });
     } catch (error) {
       return res.status(500).json({
@@ -171,7 +188,7 @@ const userService = {
 
       return res.json({
         total: users.count,
-        users: users.rows,
+         users: users.rows.map(getCleanProfile),
         page: pageNum,
         pages: Math.ceil(users.count / limitNum)
       });
@@ -185,7 +202,21 @@ const userService = {
   async update(req, res) {
     try {
       const { userId } = req.params;
+       const requestedBy = String(req.userId || "");
+
+       if (String(userId) !== requestedBy) {
+         return res.status(403).json({
+           error: "Forbidden: you can only update your own profile"
+         });
+       }
+
       const { name, email } = req.body;
+
+       if (!name && !email) {
+         return res.status(400).json({
+           error: "At least one field (name or email) is required"
+         });
+       }
 
       const user = await User.findByPk(userId);
 
@@ -195,18 +226,104 @@ const userService = {
         });
       }
 
-      const updatedUser = await user.update({
-        name: name || user.name,
-        email: email || user.email
-      });
+       const updateData = {};
+       if (name) {
+         updateData.name = String(name).trim();
+       }
+       if (email) {
+         const trimmedEmail = String(email).trim().toLowerCase();
+         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+         if (!emailRegex.test(trimmedEmail)) {
+           return res.status(400).json({
+             error: "Invalid email format"
+           });
+         }
+         const emailOwner = await User.findOne({ where: { email: trimmedEmail } });
+         if (emailOwner && String(emailOwner.id) !== String(user.id)) {
+           return res.status(409).json({
+             error: "Email is already used by another account"
+           });
+         }
+         updateData.email = trimmedEmail;
+       }
+
+       const updatedUser = await user.update(updateData);
 
       return res.json({
         message: "User updated successfully",
-        data: updatedUser
+         data: getCleanProfile(updatedUser)
       });
     } catch (error) {
       return res.status(500).json({
-        error: "Failed to update user"
+         error: error.message || "Failed to update user"
+      });
+    }
+  },
+
+  async editProfile(req, res) {
+    try {
+      const { userId } = req.params;
+      const requestedBy = String(req.userId || "");
+
+      console.log(`[editProfile] Route hit: userId=${userId}, requestedBy=${requestedBy}, body=`, req.body);
+
+      if (String(userId) !== requestedBy) {
+        console.log(`[editProfile] Access denied: ${userId} !== ${requestedBy}`);
+        return res.status(403).json({
+          error: "Forbidden: you can only edit your own profile"
+        });
+      }
+
+      const rawName = String(req.body?.name || "").trim();
+      const rawEmail = String(req.body?.email || "").trim().toLowerCase();
+
+      console.log(`[editProfile] Validating: name="${rawName}", email="${rawEmail}"`);
+
+      if (!rawName || !rawEmail) {
+        console.log(`[editProfile] Missing required fields`);
+        return res.status(400).json({
+          error: "name and email are required"
+        });
+      }
+
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(rawEmail)) {
+        console.log(`[editProfile] Invalid email format: ${rawEmail}`);
+        return res.status(400).json({
+          error: "Invalid email format"
+        });
+      }
+
+      const user = await User.findByPk(userId);
+      if (!user) {
+        console.log(`[editProfile] User not found: ${userId}`);
+        return res.status(404).json({
+          error: "User not found"
+        });
+      }
+
+      const emailOwner = await User.findOne({ where: { email: rawEmail } });
+      if (emailOwner && String(emailOwner.id) !== String(user.id)) {
+        console.log(`[editProfile] Email already owned by another user: ${rawEmail}`);
+        return res.status(409).json({
+          error: "Email is already used by another account"
+        });
+      }
+
+      const updatedUser = await user.update({
+        name: rawName,
+        email: rawEmail
+      });
+
+      console.log(`[editProfile] Profile updated successfully for ${userId}`);
+      return res.json({
+        message: "Profile updated successfully",
+         data: getCleanProfile(updatedUser)
+      });
+    } catch (error) {
+      console.error(`[editProfile] Exception:`, error.message);
+      return res.status(500).json({
+        error: "Failed to update profile"
       });
     }
   },
@@ -214,6 +331,13 @@ const userService = {
   async delete(req, res) {
     try {
       const { userId } = req.params;
+       const requestedBy = String(req.userId || "");
+
+       if (String(userId) !== requestedBy) {
+         return res.status(403).json({
+           error: "Forbidden: you can only delete your own account"
+         });
+       }
 
       const user = await User.findByPk(userId);
 
@@ -226,11 +350,11 @@ const userService = {
       await user.destroy();
 
       return res.json({
-        message: "User deleted successfully"
+         message: "User account deleted successfully"
       });
     } catch (error) {
       return res.status(500).json({
-        error: "Failed to delete user"
+         error: error.message || "Failed to delete user"
       });
     }
   }

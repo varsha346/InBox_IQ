@@ -9,6 +9,22 @@ const jwt = require("jsonwebtoken");
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI;
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+
+function buildFrontendUrl(path, params = {}) {
+  const url = new URL(path, FRONTEND_URL);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  });
+  return url.toString();
+}
+
+function requestWantsJson(req) {
+  const acceptHeader = String(req.headers?.accept || "").toLowerCase();
+  return acceptHeader.includes("application/json") && !acceptHeader.includes("text/html");
+}
 
 function decodeHtmlEntities(text) {
   if (!text || typeof text !== "string") return "";
@@ -255,12 +271,18 @@ const gmailService = {
       const { code, error } = req.query;
 
       if (error) {
+        if (!requestWantsJson(req)) {
+          return res.redirect(buildFrontendUrl("/auth/google/callback", { error }));
+        }
         return res.status(400).json({
           error: `Authorization denied: ${error}`
         });
       }
 
       if (!code) {
+        if (!requestWantsJson(req)) {
+          return res.redirect(buildFrontendUrl("/auth/google/callback", { error: "Authorization code not found" }));
+        }
         return res.status(400).json({
           error: "Authorization code not found"
         });
@@ -294,6 +316,30 @@ const gmailService = {
         tokens.expiry_date
       );
 
+      // Best effort: start watch automatically after OAuth completes.
+      let watchStatus = { started: false, error: null };
+      try {
+        const configuredTopic = process.env.GMAIL_PUBSUB_TOPIC;
+        const resolvedTopic = gmailService.resolveTopicName(configuredTopic);
+
+        if (resolvedTopic) {
+          const { gmail } = await gmailService.getGmailClientForUser(user.id);
+          await gmail.users.watch({
+            userId: "me",
+            requestBody: {
+              topicName: resolvedTopic,
+              labelIds: ["INBOX"],
+              labelFilterAction: "include"
+            }
+          });
+          watchStatus.started = true;
+        } else {
+          watchStatus.error = "GMAIL_PUBSUB_TOPIC is missing or invalid";
+        }
+      } catch (watchError) {
+        watchStatus.error = watchError.message || "Failed to start Gmail watch";
+      }
+
       const jwtToken = jwt.sign(
         { userId: user.id },
         process.env.JWT_SECRET,
@@ -302,15 +348,28 @@ const gmailService = {
 
       setTokenCookie(res, jwtToken);
 
+      if (!requestWantsJson(req)) {
+        return res.redirect(buildFrontendUrl("/auth/google/callback", {
+          userId: user.id,
+          oauth: "success"
+        }));
+      }
+
       return res.json({
         message: "Login successful",
         token: jwtToken,
         userId: user.id,
         emailsFetched: fetchResult.newEmails.length,
         unreadSync: fetchResult.unreadSync,
-        prioritySync: fetchResult.prioritySync
+        prioritySync: fetchResult.prioritySync,
+        watch: watchStatus
       });
     } catch (error) {
+      if (!requestWantsJson(req)) {
+        return res.redirect(buildFrontendUrl("/auth/google/callback", {
+          error: error.message || "OAuth login failed"
+        }));
+      }
       return res.status(500).json({
         error: error.message || "OAuth login failed"
       });
