@@ -7,6 +7,9 @@ const { authenticateToken } = require("../middlewares/authmiddleware");
 router.post("/register", authService.register);
 router.post("/login", authService.login);
 
+// Authenticated user bootstrap
+router.get("/me", authenticateToken, authService.me);
+
 // Protected routes (JWT cookie required)
 router.post("/logout", authenticateToken, authService.logout);
 

@@ -3,8 +3,95 @@ const express = require("express");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const { sequelize } = require("./models");
+const { DataTypes } = require("sequelize");
 
 const app = express();
+
+const FRONTEND_URL = String(process.env.FRONTEND_URL || "http://localhost:5173").trim();
+
+function buildFrontendUrl(path, params = {}) {
+  const url = new URL(path, FRONTEND_URL);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  });
+  return url.toString();
+}
+
+async function ensureDatabaseCompatibility() {
+  const queryInterface = sequelize.getQueryInterface();
+
+  async function renameColumnIfNeeded(tableName, from, to) {
+    const table = await queryInterface.describeTable(tableName);
+
+    if (table[to] || !table[from]) {
+      return;
+    }
+
+    await queryInterface.renameColumn(tableName, from, to);
+  }
+
+  async function addColumnIfMissing(tableName, columnName, definition) {
+    const table = await queryInterface.describeTable(tableName);
+
+    if (table[columnName]) {
+      return;
+    }
+
+    await queryInterface.addColumn(tableName, columnName, definition);
+  }
+
+  await addColumnIfMissing("users", "outlook_id", {
+    type: DataTypes.STRING,
+    allowNull: true
+  });
+
+  await addColumnIfMissing("users", "outlook_email", {
+    type: DataTypes.STRING,
+    allowNull: true
+  });
+
+  await addColumnIfMissing("users", "encrypted_outlook_access_token", {
+    type: DataTypes.TEXT,
+    allowNull: true
+  });
+  await addColumnIfMissing("users", "encrypted_outlook_refresh_token", {
+    type: DataTypes.TEXT,
+    allowNull: true
+  });
+  await addColumnIfMissing("users", "outlook_token_expiry", {
+    type: DataTypes.DATE,
+    allowNull: true
+  });
+
+  await renameColumnIfNeeded("emails", "gmail_message_id", "mail_msg_id");
+  await renameColumnIfNeeded("emails", "gmail_thread_id", "mail_thread_id");
+  await renameColumnIfNeeded("emails", "gmail_link", "mail_link");
+
+  async function removeColumnIfExists(tableName, columnName) {
+    const table = await queryInterface.describeTable(tableName);
+
+    if (!table[columnName]) {
+      return;
+    }
+
+    await queryInterface.removeColumn(tableName, columnName);
+  }
+
+  await removeColumnIfExists("emails", "body");
+  await removeColumnIfExists("emails", "body_plain");
+  await removeColumnIfExists("emails", "body_html");
+
+  await addColumnIfMissing("emails", "provider", {
+    type: DataTypes.STRING,
+    allowNull: true,
+    defaultValue: "gmail"
+  });
+
+  await sequelize.query("UPDATE users SET outlook_email = email WHERE outlook_id IS NOT NULL AND (outlook_email IS NULL OR outlook_email = '')");
+  await sequelize.query("UPDATE emails SET provider = 'gmail' WHERE provider IS NULL");
+}
 
 const defaultFrontendOrigins = [
   "http://localhost:5173",
@@ -60,11 +147,11 @@ app.use((req, res, next) => {
   next();
 });
 
-sequelize.sync().then(() => {
-  console.log("Database connected");
-});
-
 const gmailRoutes = require("./routes/gmailroute");
+const outlookRoutes = require("./routes/outlookroute");
+const emailRoutes = require("./routes/emailroute");
+const outlookService = require("./services/outlookservice");
+const mailCleanupService = require("./services/mailcleanupservice");
 const priorityRoutes = require("./routes/priorityroute");
 const processingRoutes = require("./routes/processingroute");
 const userRoutes = require("./routes/userroute");
@@ -75,11 +162,17 @@ app.get("/google/login", (req, res) => {
   return res.redirect("/gmail/login");
 });
 
+// Outlook OAuth callback endpoint used by Microsoft redirect_uri.
+app.get("/auth/outlook/callback", outlookService.oauthCallback);
+
 // Mount OAuth callback directly at /login/oauth2/code/google (as per .env REDIRECT_URI)
 app.use("/login/oauth2/code", gmailRoutes);
+app.use("/login/oauth2/code", outlookRoutes);
 
 // Mount other Gmail routes
 app.use("/gmail", gmailRoutes);
+app.use("/outlook", outlookRoutes);
+app.use("/email", emailRoutes);
 app.use("/priority", priorityRoutes);
 app.use("/processing", processingRoutes);
 app.use("/users", userRoutes);
@@ -111,6 +204,19 @@ try {
 
 const PORT = redirectUriPort || Number(process.env.PORT) || 8000;
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+async function bootstrap() {
+  await ensureDatabaseCompatibility();
+  await sequelize.sync();
+  console.log("Database connected");
+
+  mailCleanupService.startAutoCleanup();
+
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+bootstrap().catch((error) => {
+  console.error("Failed to start server:", error);
+  process.exit(1);
 });

@@ -8,6 +8,7 @@ router.post("/analyze/:emailId", authenticateToken, priorityService.analyzeEmail
 router.post("/analyze/user/:userId", authenticateToken, priorityService.analyzeUserEmailsRoute);
 router.get("/user/:userId/emails", authenticateToken, priorityService.listUserEmailsRoute);
 router.get("/user/:userId/search", authenticateToken, priorityService.searchUserEmailsRoute);
+router.get("/user/:userId/combined", authenticateToken, priorityService.getCombinedUserEmailsRoute);
 router.get("/:emailId", authenticateToken, priorityService.getPriorityRoute);
 router.post("/reanalyze/user/:userId", authenticateToken, priorityService.reanalyzeUserEmailsRoute);
 

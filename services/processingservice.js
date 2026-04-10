@@ -24,7 +24,7 @@ const processingService = {
     async buildAnalysisContext(email) {
         const emailWithLabels = await Email.findByPk(email.id, {
             include: [{ model: Label, through: { attributes: [] }, required: false }],
-            attributes: ["id", "user_id", "gmail_thread_id", "sender_email", "received_at"]
+            attributes: ["id", "user_id", "mail_thread_id", "sender_email", "received_at"]
         });
 
         const labelNames = [...new Set(
@@ -33,11 +33,11 @@ const processingService = {
                 .filter(Boolean)
         )];
 
-        const threadEmails = email.gmail_thread_id
+        const threadEmails = email.mail_thread_id
             ? await Email.findAll({
                 where: {
                     user_id: email.user_id,
-                    gmail_thread_id: email.gmail_thread_id
+                    mail_thread_id: email.mail_thread_id
                 },
                 attributes: ["id", "is_read", "received_at", "sender_email"]
             })

@@ -1,6 +1,7 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { User } = require("../models");
+const userService = require("./userservice");
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
@@ -83,7 +84,7 @@ const authService = {
 
       return res.status(201).json({
         message: "Account created successfully.",
-        user: { id: user.id, name: user.name, email: user.email }
+        user: userService.getCleanProfile(user)
       });
     } catch (error) {
       console.error("[authService.register]", error);
@@ -120,11 +121,33 @@ const authService = {
 
       return res.json({
         message: "Logged in successfully.",
-        user: { id: user.id, name: user.name, email: user.email }
+        user: userService.getCleanProfile(user)
       });
     } catch (error) {
       console.error("[authService.login]", error);
       return res.status(500).json({ error: "Login failed. Please try again." });
+    }
+  },
+
+  /**
+   * GET /auth/me (protected)
+   * Returns the authenticated user from the JWT cookie.
+   */
+  async me(req, res) {
+    try {
+      const user = await User.findByPk(req.userId);
+
+      if (!user) {
+        return res.status(404).json({ error: "User not found." });
+      }
+
+      return res.json({
+        message: "Authenticated user retrieved successfully.",
+        user: userService.getCleanProfile(user)
+      });
+    } catch (error) {
+      console.error("[authService.me]", error);
+      return res.status(500).json({ error: "Failed to fetch authenticated user." });
     }
   },
 
@@ -162,7 +185,7 @@ const authService = {
 
       const user = await User.findByPk(req.userId);
       if (!user || !user.password_hash) {
-        return res.status(404).json({ error: "User not found or uses Google sign-in." });
+        return res.status(404).json({ error: "User not found or uses social sign-in." });
       }
 
       const isValid = await bcrypt.compare(currentPassword, user.password_hash);

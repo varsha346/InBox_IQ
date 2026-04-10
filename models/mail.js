@@ -12,11 +12,11 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: false
     },
 
-    gmail_message_id: DataTypes.STRING,
-    gmail_thread_id: DataTypes.STRING,
+    provider: DataTypes.STRING,
+    mail_msg_id: DataTypes.STRING, 
+    mail_thread_id: DataTypes.STRING,
     subject: DataTypes.TEXT,
     snippet: DataTypes.TEXT,
-    body: DataTypes.TEXT("long"),
 
     sender_email: DataTypes.STRING,
     sender_name: DataTypes.STRING,
@@ -26,7 +26,7 @@ module.exports = (sequelize, DataTypes) => {
     is_read: DataTypes.BOOLEAN,
     
 
-    gmail_link: DataTypes.TEXT
+    mail_link: DataTypes.TEXT
 
   }, {
     tableName: "emails",

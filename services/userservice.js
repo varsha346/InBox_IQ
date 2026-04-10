@@ -6,11 +6,23 @@ const { encrypt, decrypt } = require("../utils/tokenCrypto");
  */
 function getCleanProfile(user) {
   if (!user) return null;
+
+  const gmailConnected = Boolean(
+    user.encrypted_access_token || user.encrypted_refresh_token
+  );
+  const outlookConnected = Boolean(
+    user.encrypted_outlook_access_token || user.encrypted_outlook_refresh_token
+  );
+
   return {
     id: user.id,
     name: user.name,
     email: user.email,
+    outlook_email: user.outlook_email || null,
     google_id: user.google_id || null,
+    outlook_id: user.outlook_id || null,
+    gmailConnected,
+    outlookConnected,
     createdAt: user.createdAt,
     updatedAt: user.updatedAt
   };
@@ -19,30 +31,126 @@ function getCleanProfile(user) {
 const userService = {
   getCleanProfile,
 
-  async createOrUpdateGoogleUser(googleProfile) {
+  hasGoogleConnection(user) {
+    return Boolean(
+      user?.google_id ||
+      user?.encrypted_access_token ||
+      user?.encrypted_refresh_token
+    );
+  },
+
+  hasOutlookConnection(user) {
+    return Boolean(
+      user?.outlook_id ||
+      user?.encrypted_outlook_access_token ||
+      user?.encrypted_outlook_refresh_token
+    );
+  },
+
+  async createOrUpdateGoogleUser(googleProfile, options = {}) {
     const { id, email, name } = googleProfile;
+    const linkedUserId = options.linkedUserId || null;
 
     let user = await User.findOne({
       where: { google_id: id }
     });
 
-    if (!user) {
-      user = await User.findOne({
-        where: { email }
-      });
+    if (!user && linkedUserId) {
+      user = await User.findByPk(linkedUserId);
+    }
+
+    if (!user && email) {
+      const emailUser = await User.findOne({ where: { email } });
+
+      if (emailUser) {
+        const emailUserHasGoogle = userService.hasGoogleConnection(emailUser);
+        const emailUserHasOutlook = userService.hasOutlookConnection(emailUser);
+
+        // Auto-link by email only for local-only accounts.
+        if (!emailUserHasGoogle && !emailUserHasOutlook) {
+          user = emailUser;
+        } else {
+          const error = new Error("This email is already linked to another provider. Sign in first and connect Gmail from Settings.");
+          error.statusCode = 409;
+          throw error;
+        }
+      }
     }
 
     if (user) {
-      user = await user.update({
-        name,
-        email,
+      const updateFields = {
         google_id: id
-      });
+      };
+
+      if (!linkedUserId) {
+        updateFields.name = name;
+        updateFields.email = email;
+      } else if (name && name !== user.name) {
+        updateFields.name = name;
+      }
+
+      user = await user.update(updateFields);
     } else {
       user = await User.create({
         name,
         email,
         google_id: id
+      });
+    }
+
+    return user;
+  },
+
+  async createOrUpdateOutlookUser(outlookProfile, options = {}) {
+    const { id, email, name } = outlookProfile;
+    const linkedUserId = options.linkedUserId || null;
+
+    let user = await User.findOne({
+      where: { outlook_id: id }
+    });
+
+    if (!user && linkedUserId) {
+      user = await User.findByPk(linkedUserId);
+    }
+
+    if (!user && email) {
+      const emailUser = await User.findOne({ where: { email } });
+
+      if (emailUser) {
+        const emailUserHasGoogle = userService.hasGoogleConnection(emailUser);
+        const emailUserHasOutlook = userService.hasOutlookConnection(emailUser);
+
+        // Auto-link by email only for local-only accounts.
+        if (!emailUserHasGoogle && !emailUserHasOutlook) {
+          user = emailUser;
+        } else {
+          const error = new Error("This email is already linked to another provider. Sign in first and connect Outlook from Settings.");
+          error.statusCode = 409;
+          throw error;
+        }
+      }
+    }
+
+    if (user) {
+      const updateFields = {
+        outlook_id: id,
+        outlook_email: email
+      };
+
+      if (!linkedUserId) {
+        updateFields.name = name;
+        updateFields.email = email;
+      } else if (name && name !== user.name) {
+        updateFields.name = name;
+      }
+
+      user = await user.update(updateFields);
+    } else {
+      user = await User.create({
+        name,
+        email,
+        outlook_email: email,
+        outlook_id: id
       });
     }
 
@@ -80,6 +188,13 @@ const userService = {
     };
   },
 
+  decryptOutlookTokens(user) {
+    return {
+      accessToken: decrypt(user.encrypted_outlook_access_token),
+      refreshToken: decrypt(user.encrypted_outlook_refresh_token)
+    };
+  },
+
   async saveTokens(userId, tokens) {
     const user = await User.findByPk(userId);
 
@@ -99,9 +214,32 @@ const userService = {
     return user.update(updateFields);
   },
 
+  async saveOutlookTokens(userId, tokens) {
+    const user = await User.findByPk(userId);
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    const expiresAt =
+      tokens.expires_at ||
+      (tokens.expires_in ? new Date(Date.now() + Number(tokens.expires_in) * 1000) : null);
+
+    const updateFields = {
+      encrypted_outlook_access_token: encrypt(tokens.access_token),
+      outlook_token_expiry: expiresAt
+    };
+
+    if (tokens.refresh_token) {
+      updateFields.encrypted_outlook_refresh_token = encrypt(tokens.refresh_token);
+    }
+
+    return user.update(updateFields);
+  },
+
   async create(req, res) {
     try {
-      const { name, email, google_id } = req.body;
+      const { name, email, google_id, outlook_id } = req.body;
 
       if (!name || !email) {
         return res.status(400).json({
@@ -120,7 +258,8 @@ const userService = {
       const user = await User.create({
         name,
         email,
-        google_id: google_id || null
+        google_id: google_id || null,
+        outlook_id: outlook_id || null
       });
 
       return res.status(201).json({

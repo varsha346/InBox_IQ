@@ -1,5 +1,5 @@
 const { Email, EmailPriority } = require("../models");
-const { Op } = require("sequelize");
+const { Op, Sequelize } = require("sequelize");
 const processingService = require("./processingservice");
 
 // ========== CONFIG ==========
@@ -33,6 +33,36 @@ function buildRecentWhereClause(userId, recentDays) {
     };
 }
 
+function normalizeUnreadOnly(value) {
+    if (value === undefined || value === null || value === "") return false;
+    const normalized = String(value).trim().toLowerCase();
+    return normalized === "true" || normalized === "1" || normalized === "yes";
+}
+
+function normalizeProvider(value) {
+    const provider = String(value || "").trim().toLowerCase();
+    if (provider === "gmail" || provider === "outlook") {
+        return provider;
+    }
+    return null;
+}
+
+function getPriorityOrder() {
+    return [
+        [Sequelize.literal(`
+            CASE
+                WHEN EmailPriority.priority_label = 'URGENT' THEN 4
+                WHEN EmailPriority.priority_label = 'IMPORTANT' THEN 3
+                WHEN EmailPriority.priority_label = 'NORMAL' THEN 2
+                WHEN EmailPriority.priority_label = 'LOW' THEN 1
+                ELSE 0
+            END
+        `), "DESC"],
+        [EmailPriority, "priority_score", "DESC"],
+        ["received_at", "DESC"]
+    ];
+}
+
 function cleanText(value, maxLength = MAX_TEXT_LENGTH) {
     return String(value || "")
         .replace(/\s+/g, " ")
@@ -55,47 +85,39 @@ Rules:
 - reason must be short (max 25 words) and concrete.
 - Do not return markdown, code fences, or extra keys.`;
 
-const SYSTEM_PROMPT = (subject, snippet, sender, context = {}, emailContent = {}) => `
+const SYSTEM_PROMPT = (subject, snippet, sender, context = {}) => `
 ${SYSTEM_INSTRUCTIONS}
 
 CONTEXT:
 Labels: ${(context.labels || []).join(", ") || "none"}
 Thread messages: ${context.threadMessageCount || 1}
-Unread: ${context.unreadInThread || 0}
+Unread in thread: ${context.unreadInThread || 0}
 Recent activity: ${context.hasRecentThreadReply ? "yes" : "no"}
 Thread participants: ${context.threadParticipantCount || 1}
-Thread first message at: ${context.threadFirstMessageAt || "unknown"}
-Thread last message at: ${context.threadLastMessageAt || "unknown"}
 
 EMAIL:
-From: ${cleanText(sender, 300)}
-Subject: ${cleanText(subject, 500)}
-Snippet: ${cleanText(snippet, 800)}
-Body (plain): ${cleanText(emailContent.bodyPlain, 4000)}
-Body (html excerpt): ${cleanText(emailContent.bodyHtml, 2500)}
+From: ${cleanText(sender, 200)}
+Subject: ${cleanText(subject, 300)}
+Preview: ${cleanText(snippet, 600)}
 `;
 
-const USER_PROMPT = (subject, snippet, sender, context = {}, userInput = "", emailContent = {}) => `
+const USER_PROMPT = (subject, snippet, sender, context = {}, userInput = "") => `
 ${SYSTEM_INSTRUCTIONS}
 
-Apply the user preferences below while classifying priority. Preferences can override default behavior.
-User preferences: ${cleanText(userInput, 1200)}
+Apply the user preferences below while classifying priority. User preferences can override default behavior.
+User preferences: ${cleanText(userInput, 1000)}
 
 CONTEXT:
 Labels: ${(context.labels || []).join(", ") || "none"}
 Thread messages: ${context.threadMessageCount || 1}
-Unread: ${context.unreadInThread || 0}
+Unread in thread: ${context.unreadInThread || 0}
 Recent activity: ${context.hasRecentThreadReply ? "yes" : "no"}
 Thread participants: ${context.threadParticipantCount || 1}
-Thread first message at: ${context.threadFirstMessageAt || "unknown"}
-Thread last message at: ${context.threadLastMessageAt || "unknown"}
 
 EMAIL:
-From: ${cleanText(sender, 300)}
-Subject: ${cleanText(subject, 500)}
-Snippet: ${cleanText(snippet, 800)}
-Body (plain): ${cleanText(emailContent.bodyPlain, 4000)}
-Body (html excerpt): ${cleanText(emailContent.bodyHtml, 2500)}
+From: ${cleanText(sender, 200)}
+Subject: ${cleanText(subject, 300)}
+Preview: ${cleanText(snippet, 600)}
 `;
 
 function clamp(value, min, max) {
@@ -356,19 +378,29 @@ const priorityService = {
             const { label } = req.query;
             const recentDays = normalizeRecentDays(req.query?.days);
             const recentLimit = normalizeRecentLimit(req.query?.limit);
+            const unreadOnly = normalizeUnreadOnly(req.query?.unreadOnly);
+            const provider = normalizeProvider(req.query?.provider);
 
             if (String(userId) !== String(req.userId)) {
                 return res.status(403).json({ error: "Forbidden: you can only access your own emails." });
             }
 
+            const whereClause = buildRecentWhereClause(userId, recentDays);
+            if (unreadOnly) {
+                whereClause.is_read = false;
+            }
+            if (provider) {
+                whereClause.provider = provider;
+            }
+
             const emails = await Email.findAll({
-                where: buildRecentWhereClause(userId, recentDays),
+                where: whereClause,
                 include: [{
                     model: EmailPriority,
-                    required: true,
+                    required: false,
                     where: label ? { priority_label: label } : {}
                 }],
-                order: [[EmailPriority, "priority_score", "DESC"], ["received_at", "DESC"]],
+                order: getPriorityOrder(),
                 limit: recentLimit
             });
 
@@ -376,20 +408,23 @@ const priorityService = {
                 total: emails.length,
                 emails: emails.map((email) => ({
                     id: email.id,
+                    provider: email.provider || "gmail",
                     subject: email.subject,
                     sender_email: email.sender_email,
                     sender_name: email.sender_name,
                     received_at: email.received_at,
                     snippet: email.snippet,
-                    gmail_link: email.gmail_link,
-                    priority: {
-                        label: email.EmailPriority.priority_label,
-                        score: email.EmailPriority.priority_score,
-                        confidence: email.EmailPriority.confidence,
-                        reason: email.EmailPriority.reason,
-                        mode: email.EmailPriority.mode,
-                        processed_at: email.EmailPriority.processed_at
-                    }
+                    mail_link: email.mail_link,
+                    priority: email.EmailPriority
+                        ? {
+                            label: email.EmailPriority.priority_label,
+                            score: email.EmailPriority.priority_score,
+                            confidence: email.EmailPriority.confidence,
+                            reason: email.EmailPriority.reason,
+                            mode: email.EmailPriority.mode,
+                            processed_at: email.EmailPriority.processed_at
+                        }
+                        : null
                 }))
             });
         } catch (error) {
@@ -403,6 +438,8 @@ const priorityService = {
             const query = String(req.query?.q || "").trim();
             const recentDays = normalizeRecentDays(req.query?.days);
             const recentLimit = normalizeRecentLimit(req.query?.limit);
+            const unreadOnly = normalizeUnreadOnly(req.query?.unreadOnly);
+            const provider = normalizeProvider(req.query?.provider);
 
             if (String(userId) !== String(req.userId)) {
                 return res.status(403).json({ error: "Forbidden: you can only access your own emails." });
@@ -413,6 +450,12 @@ const priorityService = {
             }
 
             const recentWhere = buildRecentWhereClause(userId, recentDays);
+            if (unreadOnly) {
+                recentWhere.is_read = false;
+            }
+            if (provider) {
+                recentWhere.provider = provider;
+            }
             const emails = await Email.findAll({
                 where: {
                     ...recentWhere,
@@ -424,9 +467,9 @@ const priorityService = {
                 },
                 include: [{
                     model: EmailPriority,
-                    required: true
+                    required: false
                 }],
-                order: [[EmailPriority, "priority_score", "DESC"], ["received_at", "DESC"]],
+                order: getPriorityOrder(),
                 limit: recentLimit
             });
 
@@ -434,20 +477,23 @@ const priorityService = {
                 total: emails.length,
                 emails: emails.map((email) => ({
                     id: email.id,
+                    provider: email.provider || "gmail",
                     subject: email.subject,
                     sender_email: email.sender_email,
                     sender_name: email.sender_name,
                     received_at: email.received_at,
                     snippet: email.snippet,
-                    gmail_link: email.gmail_link,
-                    priority: {
-                        label: email.EmailPriority.priority_label,
-                        score: email.EmailPriority.priority_score,
-                        confidence: email.EmailPriority.confidence,
-                        reason: email.EmailPriority.reason,
-                        mode: email.EmailPriority.mode,
-                        processed_at: email.EmailPriority.processed_at
-                    }
+                    mail_link: email.mail_link,
+                    priority: email.EmailPriority
+                        ? {
+                            label: email.EmailPriority.priority_label,
+                            score: email.EmailPriority.priority_score,
+                            confidence: email.EmailPriority.confidence,
+                            reason: email.EmailPriority.reason,
+                            mode: email.EmailPriority.mode,
+                            processed_at: email.EmailPriority.processed_at
+                        }
+                        : null
                 }))
             });
         } catch (error) {
@@ -479,14 +525,73 @@ const priorityService = {
         }
     },
 
-    async analyzeWithOpenRouter(subject, snippet, sender, context = {}, userInput = "", emailContent = {}) {
+    async getCombinedUserEmailsRoute(req, res) {
+        try {
+            const { userId } = req.params;
+            const offset = Math.max(0, Number(req.query?.offset || 0));
+            const limit = Math.min(Number(req.query?.limit || 8), 50);
+            const recentDays = normalizeRecentDays(req.query?.days || 14);
+            const provider = normalizeProvider(req.query?.provider);
+
+            if (String(userId) !== String(req.userId)) {
+                return res.status(403).json({ error: "Forbidden: you can only access your own emails." });
+            }
+
+            const whereClause = buildRecentWhereClause(userId, recentDays);
+            if (provider) {
+                whereClause.provider = provider;
+            }
+
+            const { count, rows } = await Email.findAndCountAll({
+                where: whereClause,
+                include: [{
+                    model: EmailPriority,
+                    required: false
+                }],
+                order: getPriorityOrder(),
+                offset,
+                limit,
+                subQuery: false
+            });
+
+            return res.json({
+                total: count,
+                offset,
+                limit,
+                emails: rows.map((email) => ({
+                    id: email.id,
+                    provider: email.provider || "gmail",
+                    subject: email.subject,
+                    sender_email: email.sender_email,
+                    sender_name: email.sender_name,
+                    received_at: email.received_at,
+                    snippet: email.snippet,
+                    mail_link: email.mail_link,
+                    priority: email.EmailPriority
+                        ? {
+                            label: email.EmailPriority.priority_label,
+                            score: email.EmailPriority.priority_score,
+                            confidence: email.EmailPriority.confidence,
+                            reason: email.EmailPriority.reason,
+                            mode: email.EmailPriority.mode,
+                            processed_at: email.EmailPriority.processed_at
+                        }
+                        : null
+                }))
+            });
+        } catch (error) {
+            return res.status(500).json({ error: error.message });
+        }
+    },
+
+    async analyzeWithOpenRouter(subject, snippet, sender, context = {}, userInput = "") {
         if (!OPENROUTER_API_KEY) {
             throw new Error("OpenRouter API key is missing. Set OPENROUTER_API_KEY in .env.");
         }
 
         const prompt = userInput && userInput.trim().length > 0
-            ? USER_PROMPT(subject || "", snippet || "", sender || "", context, userInput, emailContent)
-            : SYSTEM_PROMPT(subject || "", snippet || "", sender || "", context, emailContent);
+            ? USER_PROMPT(subject || "", snippet || "", sender || "", context, userInput)
+            : SYSTEM_PROMPT(subject || "", snippet || "", sender || "", context);
 
         const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
             method: "POST",
@@ -526,8 +631,8 @@ const priorityService = {
         return normalized;
     },
 
-    async analyzeWithProvider(subject, snippet, sender, context = {}, userInput = "", emailContent = {}) {
-        return priorityService.analyzeWithOpenRouter(subject, snippet, sender, context, userInput, emailContent);
+    async analyzeWithProvider(subject, snippet, sender, context = {}, userInput = "") {
+        return priorityService.analyzeWithOpenRouter(subject, snippet, sender, context, userInput);
     },
 
     async savePriority(emailId, analysisResult) {
@@ -556,9 +661,6 @@ const priorityService = {
 
         const userInput = processingService.normalizeUserInput(options.userInput);
         const analysisContext = await processingService.buildAnalysisContext(email);
-        const promptEmailContent = PRIORITY_USE_SNIPPET_ONLY
-            ? { bodyPlain: "", bodyHtml: "" }
-            : { bodyPlain: email.body || "", bodyHtml: "" };
 
         await processingService.beginProcessing(email.id);
 
@@ -571,8 +673,7 @@ const priorityService = {
                     email.snippet,
                     email.sender_email,
                     analysisContext,
-                    userInput,
-                    promptEmailContent
+                    userInput
                 );
             } catch (error) {
                 if (OPENROUTER_FALLBACK_ON_ERROR) {

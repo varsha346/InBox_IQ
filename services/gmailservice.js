@@ -1,5 +1,5 @@
 const { google } = require("googleapis");
-const { Email, Label } = require("../models");
+const { Email, Label, EmailPriority } = require("../models");
 const userService = require("./userservice");
 const priorityService = require("./priorityservice");
 const sseService = require("./sseservice");
@@ -26,55 +26,52 @@ function requestWantsJson(req) {
   return acceptHeader.includes("application/json") && !acceptHeader.includes("text/html");
 }
 
-function decodeHtmlEntities(text) {
-  if (!text || typeof text !== "string") return "";
+function getLinkedUserIdFromCookie(req) {
+  const token = req.cookies?.token || null;
 
-  const namedEntities = {
-    amp: "&",
-    apos: "'",
-    gt: ">",
-    lt: "<",
-    nbsp: " ",
-    quot: '"'
-  };
+  if (!token || !process.env.JWT_SECRET) {
+    return null;
+  }
 
-  return text.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (match, entity) => {
-    const normalizedEntity = entity.toLowerCase();
-
-    if (normalizedEntity[0] === "#") {
-      const isHex = normalizedEntity[1] === "x";
-      const numericValue = Number.parseInt(
-        normalizedEntity.slice(isHex ? 2 : 1),
-        isHex ? 16 : 10
-      );
-
-      return Number.isNaN(numericValue) ? match : String.fromCodePoint(numericValue);
-    }
-
-    return namedEntities[normalizedEntity] || match;
-  });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    return decoded?.userId || null;
+  } catch {
+    return null;
+  }
 }
 
-function htmlToReadableText(html) {
-  if (!html || typeof html !== "string") return "";
+function buildOauthLinkState(req, provider) {
+  const linkedUserId = getLinkedUserIdFromCookie(req);
+  if (!linkedUserId || !process.env.JWT_SECRET) {
+    return null;
+  }
 
-  const normalizedText = html
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>|<\/div>|<\/section>|<\/article>|<\/h[1-6]>/gi, "\n")
-    .replace(/<li\b[^>]*>/gi, "- ")
-    .replace(/<\/li>|<\/tr>/gi, "\n")
-    .replace(/<\/td>|<\/th>/gi, "\t")
-    .replace(/<[^>]+>/g, " ");
+  return jwt.sign(
+    { linkUserId: linkedUserId, provider },
+    process.env.JWT_SECRET,
+    { expiresIn: "15m" }
+  );
+}
 
-  return decodeHtmlEntities(normalizedText)
-    .replace(/\r/g, "")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n[ \t]+/g, "\n")
-    .replace(/[ \t]{2,}/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+function getLinkedUserIdFromState(state, provider) {
+  if (!state || !process.env.JWT_SECRET) {
+    return null;
+  }
+
+  try {
+    const decoded = jwt.verify(String(state), process.env.JWT_SECRET);
+    if (decoded?.provider !== provider) {
+      return null;
+    }
+    return decoded?.linkUserId || null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveLinkedUserId(req, provider) {
+  return getLinkedUserIdFromCookie(req) || getLinkedUserIdFromState(req.query?.state, provider);
 }
 
 function setTokenCookie(res, token) {
@@ -91,6 +88,16 @@ const SCOPES = [
   "https://www.googleapis.com/auth/userinfo.email",
   "https://www.googleapis.com/auth/userinfo.profile"
 ];
+
+function getGmailRecentDays() {
+  const configured = Number(process.env.GMAIL_FETCH_RECENT_DAYS || 2);
+  if (!Number.isFinite(configured)) {
+    return 2;
+  }
+
+  // Keep the fetch window narrow: only 1-2 days.
+  return Math.min(Math.max(Math.floor(configured), 1), 2);
+}
 
 const gmailService = {
   /**
@@ -251,10 +258,13 @@ const gmailService = {
         REDIRECT_URI
       );
 
+      const oauthState = buildOauthLinkState(req, "google");
+
       const authUrl = oauth2Client.generateAuthUrl({
         access_type: "offline",
         scope: SCOPES,
-        prompt: "consent"
+        prompt: "consent",
+        ...(oauthState ? { state: oauthState } : {})
       });
 
       return res.json({
@@ -301,10 +311,14 @@ const gmailService = {
       const googleUserResponse = await oauth2.userinfo.get();
       const googleUser = googleUserResponse.data;
 
+      const linkedUserId = resolveLinkedUserId(req, "google");
+
       const user = await userService.createOrUpdateGoogleUser({
         id: googleUser.id,
         email: googleUser.email,
         name: googleUser.name
+      }, {
+        linkedUserId
       });
 
       await userService.saveTokens(user.id, tokens);
@@ -531,62 +545,16 @@ const gmailService = {
       auth: oauth2Client
     });
 
+    const recentDays = getGmailRecentDays();
     const listResponse = await gmail.users.messages.list({
       userId: "me",
-      maxResults: 20
+      maxResults: 20,
+      q: `in:inbox is:unread newer_than:${recentDays}d`
     });
 
     const messages = listResponse.data.messages || [];
     const savedEmails = [];
-
-    function decodeBase64Url(data) {
-      if (!data || typeof data !== "string") return "";
-
-      const normalized = data.replace(/-/g, "+").replace(/_/g, "/");
-      const padding = normalized.length % 4;
-      const padded = padding ? normalized + "=".repeat(4 - padding) : normalized;
-
-      try {
-        return Buffer.from(padded, "base64").toString("utf8");
-      } catch {
-        return "";
-      }
-    }
-
-    function collectBodyParts(part, accumulator) {
-      if (!part) return;
-
-      if (part.mimeType === "text/plain" && part.body?.data) {
-        accumulator.plain.push(decodeBase64Url(part.body.data));
-      }
-
-      if (part.mimeType === "text/html" && part.body?.data) {
-        accumulator.html.push(decodeBase64Url(part.body.data));
-      }
-
-      if (Array.isArray(part.parts)) {
-        for (const child of part.parts) {
-          collectBodyParts(child, accumulator);
-        }
-      }
-    }
-
-    function extractMessageBodies(payload, snippet) {
-      const pieces = { plain: [], html: [] };
-      collectBodyParts(payload, pieces);
-
-      const plainBody = pieces.plain.join("\n\n").trim();
-      const htmlBody = pieces.html.join("\n\n").trim();
-      const topLevelBody = decodeBase64Url(payload?.body?.data || "").trim();
-      const topLevelPlainBody = payload?.mimeType === "text/plain" ? topLevelBody : "";
-      const topLevelHtmlBody = payload?.mimeType === "text/html" ? topLevelBody : "";
-      const normalizedHtmlBody = htmlBody || topLevelHtmlBody || "";
-      const derivedPlainBody = htmlToReadableText(normalizedHtmlBody);
-      const normalizedPlainBody = plainBody || topLevelPlainBody || derivedPlainBody || snippet || "";
-      const preferredBody = normalizedPlainBody || normalizedHtmlBody || snippet || "";
-
-      return preferredBody;
-    }
+    const emailsToAnalyze = [];
 
     async function syncLabelsForEmail(emailRecord, labelIds) {
       const uniqueLabels = [...new Set((labelIds || []).filter(Boolean))];
@@ -604,7 +572,7 @@ const gmailService = {
       const msg = await gmail.users.messages.get({
         userId: "me",
         id: message.id,
-        format: "full"
+        format: "metadata"
       });
 
       const payload = msg.data.payload || {};
@@ -615,62 +583,74 @@ const gmailService = {
       const date = headers.find((h) => h.name === "Date")?.value || "";
       const snippet = msg.data.snippet || "";
       const labels = msg.data.labelIds || [];
-      const body = extractMessageBodies(payload, snippet);
 
       const fromMatch = from.match(/^(.*?)\s*<(.+?)>$|^(.+?)$/);
       const senderName = fromMatch ? (fromMatch[1] || fromMatch[3] || "") : "";
       const senderEmail = fromMatch ? (fromMatch[2] || fromMatch[3] || "") : "";
 
       const exists = await Email.findOne({
-        where: { gmail_message_id: message.id }
+        where: {
+          user_id: userId,
+          provider: "gmail",
+          mail_msg_id: message.id
+        }
       });
 
       if (exists) {
         await exists.update({
-          gmail_thread_id: msg.data.threadId,
+          provider: "gmail",
+          mail_thread_id: msg.data.threadId,
           subject,
           snippet,
-          body,
           sender_email: senderEmail,
           sender_name: senderName,
           received_at: date ? new Date(date) : null,
           is_read: !labels.includes("UNREAD"),
-          gmail_link: `https://mail.google.com/mail/u/0/#inbox/${message.id}`
+          mail_link: `https://mail.google.com/mail/u/0/#inbox/${message.id}`
         });
 
         await syncLabelsForEmail(exists, labels);
+
+        const existingPriority = await EmailPriority.findOne({
+          where: { email_id: exists.id },
+          attributes: ["id"]
+        });
+
+        if (!existingPriority) {
+          emailsToAnalyze.push(exists);
+        }
         continue;
       }
 
       const email = await Email.create({
         user_id: userId,
-        gmail_message_id: message.id,
-        gmail_thread_id: msg.data.threadId,
+        provider: "gmail",
+        mail_msg_id: message.id,
+        mail_thread_id: msg.data.threadId,
         subject,
         snippet,
-        body,
         sender_email: senderEmail,
         sender_name: senderName,
         received_at: date ? new Date(date) : null,
         is_read: !labels.includes("UNREAD"),
-       
-        gmail_link: `https://mail.google.com/mail/u/0/#inbox/${message.id}`
+        mail_link: `https://mail.google.com/mail/u/0/#inbox/${message.id}`
       });
 
       await syncLabelsForEmail(email, labels);
 
       savedEmails.push(email);
+      emailsToAnalyze.push(email);
     }
 
     const unreadSync = await gmailService.syncUnreadStatuses(userId, gmail);
 
     const prioritySync = {
-      attempted: savedEmails.length,
+      attempted: emailsToAnalyze.length,
       analyzed: 0,
       failed: 0
     };
 
-    for (const emailRecord of savedEmails) {
+    for (const emailRecord of emailsToAnalyze) {
       try {
         const outcome = await priorityService.analyzeEmail(emailRecord.id, { userInput: "" });
         if (outcome.success) {
@@ -701,7 +681,8 @@ const gmailService = {
     return {
       newEmails: savedEmails,
       unreadSync,
-      prioritySync
+      prioritySync,
+      windowDays: recentDays
     };
   },
 
@@ -709,9 +690,10 @@ const gmailService = {
     const unreadEmails = await Email.findAll({
       where: {
         user_id: userId,
+        provider: "gmail",
         is_read: false
       },
-      attributes: ["id", "gmail_message_id"]
+      attributes: ["id", "mail_msg_id"]
     });
 
     let markedRead = 0;
@@ -719,7 +701,7 @@ const gmailService = {
     let failed = 0;
 
     for (const email of unreadEmails) {
-      if (!email.gmail_message_id) {
+      if (!email.mail_msg_id) {
         failed++;
         continue;
       }
@@ -727,7 +709,7 @@ const gmailService = {
       try {
         const gmailMessage = await gmailClient.users.messages.get({
           userId: "me",
-          id: email.gmail_message_id,
+          id: email.mail_msg_id,
           format: "metadata"
         });
 
@@ -762,7 +744,10 @@ const gmailService = {
       const offset = (pageNum - 1) * limitNum;
 
       const emails = await Email.findAndCountAll({
-        where: { user_id: userId },
+        where: { user_id: userId,
+          provider: "gmail"
+
+         },
         offset,
         limit: limitNum,
         order: [["received_at", "DESC"]]

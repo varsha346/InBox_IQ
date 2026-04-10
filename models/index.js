@@ -2,11 +2,11 @@ const sequelize = require("../config/database");
 const { DataTypes } = require("sequelize");
 
 const User = require("./user")(sequelize, DataTypes);
-const Email = require("./gmail")(sequelize, DataTypes);
+const Email = require("./mail")(sequelize, DataTypes);
 const Label = require("./label")(sequelize, DataTypes);
-const EmailLabel = require("./gmaillabel")(sequelize, DataTypes);
-const EmailPriority = require("./gmailpriority")(sequelize, DataTypes);
-const EmailProcessingLog = require("./gmailprocessinglog")(sequelize, DataTypes);
+const EmailLabel = require("./emaillabel")(sequelize, DataTypes);
+const EmailPriority = require("./emailpriority")(sequelize, DataTypes);
+const EmailProcessingLog = require("./emailprocessinglog")(sequelize, DataTypes);
 
 /* Associations */
 

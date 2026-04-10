@@ -7,7 +7,7 @@ const { authenticateToken } = require("../middlewares/authmiddleware");
 router.post("/create", authenticateToken, userService.create);
 router.get("/email/:email", authenticateToken, userService.getByEmail);
 router.get("/", authenticateToken, userService.getAll);
-router.put("/profile/:userId", authenticateToken, userService.editProfile);
+router.put("/profile/:userId", authenticateToken, userService.update);
 router.get("/:userId", authenticateToken, userService.getById);
 router.put("/:userId", authenticateToken, userService.update);
 router.delete("/:userId", authenticateToken, userService.delete);
