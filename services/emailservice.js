@@ -4,7 +4,7 @@
  * OAuth flows remain in provider-specific services (gmailservice, outlookservice)
  */
 
-const { Email, EmailPriority } = require("../models");
+const { Email, EmailPriority, Account } = require("../models");
 const { Op, Sequelize } = require("sequelize");
 const priorityService = require("./priorityservice");
 
@@ -29,6 +29,23 @@ function normalizeProvider(value) {
 }
 
 const emailService = {
+
+    buildSource(provider, account) {
+        const normalizedProvider = String(provider || "unknown").trim().toLowerCase();
+        const accountEmail = String(account?.email || "").trim();
+        const accountDisplay = String(account?.display_name || "").trim();
+
+        if (accountEmail) {
+            return `${normalizedProvider} - ${accountEmail}`;
+        }
+
+        if (accountDisplay) {
+            return `${normalizedProvider} - ${accountDisplay}`;
+        }
+
+        return normalizedProvider;
+    },
+
     /**
      * Get all emails for a user with optional filtering
      */
@@ -51,7 +68,10 @@ const emailService = {
 
             const { count, rows } = await Email.findAndCountAll({
                 where: whereClause,
-                include: [{ model: EmailPriority, required: false }],
+                include: [
+                    { model: EmailPriority, required: false },
+                    { model: Account, as: "account", required: false }
+                ],
                 order: [["received_at", "DESC"]],
                 offset,
                 limit: limitNum
@@ -76,7 +96,10 @@ const emailService = {
         try {
             const { emailId } = req.params;
             const email = await Email.findByPk(emailId, {
-                include: [{ model: EmailPriority, required: false }]
+                include: [
+                    { model: EmailPriority, required: false },
+                    { model: Account, as: "account", required: false }
+                ]
             });
 
             if (!email) {
@@ -112,7 +135,10 @@ const emailService = {
 
             const emails = await Email.findAll({
                 where: whereClause,
-                include: [{ model: EmailPriority, required: false }],
+                include: [
+                    { model: EmailPriority, required: false },
+                    { model: Account, as: "account", required: false }
+                ],
                 order: [["received_at", "DESC"]],
                 limit: 50
             });
@@ -163,7 +189,10 @@ const emailService = {
 
             const emails = await Email.findAll({
                 where: whereClause,
-                include: [{ model: EmailPriority, required: false }],
+                include: [
+                    { model: EmailPriority, required: false },
+                    { model: Account, as: "account", required: false }
+                ],
                 order: [["received_at", "DESC"]],
                 limit: limitNum
             });
@@ -209,7 +238,10 @@ const emailService = {
 
             const emails = await Email.findAll({
                 where: whereClause,
-                include: [{ model: EmailPriority, required: false }],
+                include: [
+                    { model: EmailPriority, required: false },
+                    { model: Account, as: "account", required: false }
+                ],
                 order: [["received_at", "DESC"]],
                 limit: limitNum
             });
@@ -227,9 +259,19 @@ const emailService = {
      * Format email response with priority data
      */
     formatEmailResponse(email) {
+        const source = emailService.buildSource(email.provider, email.account);
+
         return {
             id: email.id,
             provider: email.provider || "unknown",
+            source,
+            source_account: email.account ? {
+                id: email.account.id,
+                email: email.account.email || null,
+                display_name: email.account.display_name || null,
+                provider_account_id: email.account.provider_account_id || null,
+                is_primary: Boolean(email.account.is_primary)
+            } : null,
             subject: email.subject,
             snippet: email.snippet,
             sender_email: email.sender_email,

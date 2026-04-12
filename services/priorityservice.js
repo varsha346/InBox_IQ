@@ -1,4 +1,4 @@
-const { Email, EmailPriority } = require("../models");
+const { Email, EmailPriority, Account } = require("../models");
 const { Op, Sequelize } = require("sequelize");
 const processingService = require("./processingservice");
 
@@ -45,6 +45,98 @@ function normalizeProvider(value) {
         return provider;
     }
     return null;
+}
+
+function buildSource(provider, account) {
+    const normalizedProvider = String(provider || "unknown").trim().toLowerCase();
+    const accountEmail = String(account?.email || "").trim();
+    const accountDisplay = String(account?.display_name || "").trim();
+
+    if (accountEmail) {
+        return `${normalizedProvider} - ${accountEmail}`;
+    }
+
+    if (accountDisplay) {
+        return `${normalizedProvider} - ${accountDisplay}`;
+    }
+
+    return normalizedProvider;
+}
+
+function formatPriorityEmail(email) {
+    return {
+        id: email.id,
+        provider: email.provider || "gmail",
+        source: buildSource(email.provider, email.account),
+        source_account: email.account
+            ? {
+                id: email.account.id,
+                email: email.account.email || null,
+                display_name: email.account.display_name || null,
+                provider_account_id: email.account.provider_account_id || null,
+                is_primary: Boolean(email.account.is_primary)
+            }
+            : null,
+        subject: email.subject,
+        sender_email: email.sender_email,
+        sender_name: email.sender_name,
+        received_at: email.received_at,
+        snippet: email.snippet,
+        mail_link: email.mail_link,
+        priority: email.EmailPriority
+            ? {
+                label: email.EmailPriority.priority_label,
+                score: email.EmailPriority.priority_score,
+                confidence: email.EmailPriority.confidence,
+                reason: email.EmailPriority.reason,
+                mode: email.EmailPriority.mode,
+                processed_at: email.EmailPriority.processed_at
+            }
+            : null
+    };
+}
+
+async function backfillAccountsForEmails(emails, userId) {
+    if (!Array.isArray(emails) || emails.length === 0) {
+        return;
+    }
+
+    const providers = [...new Set(
+        emails
+            .map((email) => normalizeProvider(email?.provider))
+            .filter(Boolean)
+    )];
+
+    if (providers.length === 0) {
+        return;
+    }
+
+    const accounts = await Account.findAll({
+        where: {
+            user_id: userId,
+            provider: { [Op.in]: providers }
+        },
+        order: [["provider", "ASC"], ["is_primary", "DESC"], ["updatedAt", "DESC"], ["createdAt", "DESC"]]
+    });
+
+    const primaryByProvider = new Map();
+    for (const account of accounts) {
+        const provider = normalizeProvider(account.provider);
+        if (!provider || primaryByProvider.has(provider)) {
+            continue;
+        }
+        primaryByProvider.set(provider, account);
+    }
+
+    for (const email of emails) {
+        if (email.account) {
+            continue;
+        }
+        const provider = normalizeProvider(email.provider);
+        if (provider && primaryByProvider.has(provider)) {
+            email.account = primaryByProvider.get(provider);
+        }
+    }
 }
 
 function getPriorityOrder() {
@@ -395,37 +487,27 @@ const priorityService = {
 
             const emails = await Email.findAll({
                 where: whereClause,
-                include: [{
-                    model: EmailPriority,
-                    required: false,
-                    where: label ? { priority_label: label } : {}
-                }],
+                include: [
+                    {
+                        model: EmailPriority,
+                        required: false,
+                        where: label ? { priority_label: label } : {}
+                    },
+                    {
+                        model: Account,
+                        as: "account",
+                        required: false
+                    }
+                ],
                 order: getPriorityOrder(),
                 limit: recentLimit
             });
 
+            await backfillAccountsForEmails(emails, userId);
+
             return res.json({
                 total: emails.length,
-                emails: emails.map((email) => ({
-                    id: email.id,
-                    provider: email.provider || "gmail",
-                    subject: email.subject,
-                    sender_email: email.sender_email,
-                    sender_name: email.sender_name,
-                    received_at: email.received_at,
-                    snippet: email.snippet,
-                    mail_link: email.mail_link,
-                    priority: email.EmailPriority
-                        ? {
-                            label: email.EmailPriority.priority_label,
-                            score: email.EmailPriority.priority_score,
-                            confidence: email.EmailPriority.confidence,
-                            reason: email.EmailPriority.reason,
-                            mode: email.EmailPriority.mode,
-                            processed_at: email.EmailPriority.processed_at
-                        }
-                        : null
-                }))
+                emails: emails.map(formatPriorityEmail)
             });
         } catch (error) {
             return res.status(500).json({ error: error.message });
@@ -468,33 +550,20 @@ const priorityService = {
                 include: [{
                     model: EmailPriority,
                     required: false
+                }, {
+                    model: Account,
+                    as: "account",
+                    required: false
                 }],
                 order: getPriorityOrder(),
                 limit: recentLimit
             });
 
+            await backfillAccountsForEmails(emails, userId);
+
             return res.json({
                 total: emails.length,
-                emails: emails.map((email) => ({
-                    id: email.id,
-                    provider: email.provider || "gmail",
-                    subject: email.subject,
-                    sender_email: email.sender_email,
-                    sender_name: email.sender_name,
-                    received_at: email.received_at,
-                    snippet: email.snippet,
-                    mail_link: email.mail_link,
-                    priority: email.EmailPriority
-                        ? {
-                            label: email.EmailPriority.priority_label,
-                            score: email.EmailPriority.priority_score,
-                            confidence: email.EmailPriority.confidence,
-                            reason: email.EmailPriority.reason,
-                            mode: email.EmailPriority.mode,
-                            processed_at: email.EmailPriority.processed_at
-                        }
-                        : null
-                }))
+                emails: emails.map(formatPriorityEmail)
             });
         } catch (error) {
             return res.status(500).json({ error: error.message });
@@ -547,6 +616,10 @@ const priorityService = {
                 include: [{
                     model: EmailPriority,
                     required: false
+                }, {
+                    model: Account,
+                    as: "account",
+                    required: false
                 }],
                 order: getPriorityOrder(),
                 offset,
@@ -554,30 +627,13 @@ const priorityService = {
                 subQuery: false
             });
 
+            await backfillAccountsForEmails(rows, userId);
+
             return res.json({
                 total: count,
                 offset,
                 limit,
-                emails: rows.map((email) => ({
-                    id: email.id,
-                    provider: email.provider || "gmail",
-                    subject: email.subject,
-                    sender_email: email.sender_email,
-                    sender_name: email.sender_name,
-                    received_at: email.received_at,
-                    snippet: email.snippet,
-                    mail_link: email.mail_link,
-                    priority: email.EmailPriority
-                        ? {
-                            label: email.EmailPriority.priority_label,
-                            score: email.EmailPriority.priority_score,
-                            confidence: email.EmailPriority.confidence,
-                            reason: email.EmailPriority.reason,
-                            mode: email.EmailPriority.mode,
-                            processed_at: email.EmailPriority.processed_at
-                        }
-                        : null
-                }))
+                emails: rows.map(formatPriorityEmail)
             });
         } catch (error) {
             return res.status(500).json({ error: error.message });

@@ -22,7 +22,26 @@ function buildFrontendUrl(path, params = {}) {
 async function ensureDatabaseCompatibility() {
   const queryInterface = sequelize.getQueryInterface();
 
+  async function tableExists(tableName) {
+    try {
+      await queryInterface.describeTable(tableName);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function ensureTableExists(tableName, definition) {
+    if (!(await tableExists(tableName))) {
+      await queryInterface.createTable(tableName, definition);
+    }
+  }
+
   async function renameColumnIfNeeded(tableName, from, to) {
+    if (!(await tableExists(tableName))) {
+      return;
+    }
+
     const table = await queryInterface.describeTable(tableName);
 
     if (table[to] || !table[from]) {
@@ -33,6 +52,10 @@ async function ensureDatabaseCompatibility() {
   }
 
   async function addColumnIfMissing(tableName, columnName, definition) {
+    if (!(await tableExists(tableName))) {
+      return;
+    }
+
     const table = await queryInterface.describeTable(tableName);
 
     if (table[columnName]) {
@@ -41,6 +64,65 @@ async function ensureDatabaseCompatibility() {
 
     await queryInterface.addColumn(tableName, columnName, definition);
   }
+
+  await ensureTableExists("accounts", {
+    id: {
+      type: DataTypes.UUID,
+      allowNull: false,
+      primaryKey: true,
+      defaultValue: DataTypes.UUIDV4
+    },
+    user_id: {
+      type: DataTypes.UUID,
+      allowNull: false
+    },
+    provider: {
+      type: DataTypes.STRING,
+      allowNull: false
+    },
+    provider_account_id: {
+      type: DataTypes.STRING,
+      allowNull: false
+    },
+    email: {
+      type: DataTypes.STRING,
+      allowNull: true
+    },
+    display_name: {
+      type: DataTypes.STRING,
+      allowNull: true
+    },
+    encrypted_access_token: {
+      type: DataTypes.TEXT,
+      allowNull: true
+    },
+    encrypted_refresh_token: {
+      type: DataTypes.TEXT,
+      allowNull: true
+    },
+    token_expiry: {
+      type: DataTypes.DATE,
+      allowNull: true
+    },
+    is_primary: {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false
+    },
+    createdAt: {
+      allowNull: false,
+      type: DataTypes.DATE
+    },
+    updatedAt: {
+      allowNull: false,
+      type: DataTypes.DATE
+    }
+  });
+
+  await addColumnIfMissing("emails", "account_id", {
+    type: DataTypes.UUID,
+    allowNull: true
+  });
 
   await addColumnIfMissing("users", "outlook_id", {
     type: DataTypes.STRING,
@@ -70,6 +152,10 @@ async function ensureDatabaseCompatibility() {
   await renameColumnIfNeeded("emails", "gmail_link", "mail_link");
 
   async function removeColumnIfExists(tableName, columnName) {
+    if (!(await tableExists(tableName))) {
+      return;
+    }
+
     const table = await queryInterface.describeTable(tableName);
 
     if (!table[columnName]) {
@@ -205,8 +291,8 @@ try {
 const PORT = redirectUriPort || Number(process.env.PORT) || 8000;
 
 async function bootstrap() {
-  await ensureDatabaseCompatibility();
   await sequelize.sync();
+  await ensureDatabaseCompatibility();
   console.log("Database connected");
 
   mailCleanupService.startAutoCleanup();

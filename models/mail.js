@@ -12,6 +12,11 @@ module.exports = (sequelize, DataTypes) => {
       allowNull: false
     },
 
+    account_id: {
+      type: DataTypes.UUID,
+      allowNull: true
+    },
+
     provider: DataTypes.STRING,
     mail_msg_id: DataTypes.STRING, 
     mail_thread_id: DataTypes.STRING,

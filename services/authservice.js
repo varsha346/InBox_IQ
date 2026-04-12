@@ -135,7 +135,7 @@ const authService = {
    */
   async me(req, res) {
     try {
-      const user = await User.findByPk(req.userId);
+      const user = await userService.getUserById(req.userId);
 
       if (!user) {
         return res.status(404).json({ error: "User not found." });

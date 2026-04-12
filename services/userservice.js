@@ -1,5 +1,134 @@
-const { User } = require("../models");
+const { User, Account } = require("../models");
 const { encrypt, decrypt } = require("../utils/tokenCrypto");
+
+function getUserAccounts(user) {
+  return user?.accounts || user?.Accounts || [];
+}
+
+function getUserAccountsForProvider(user, provider) {
+  const normalizedProvider = String(provider || "").trim().toLowerCase();
+
+  return getUserAccounts(user).filter((account) => (
+    String(account.provider || "").trim().toLowerCase() === normalizedProvider
+  ));
+}
+
+function getPrimaryProviderAccount(user, provider, providerAccountId = null) {
+  const accounts = getUserAccountsForProvider(user, provider);
+
+  if (providerAccountId) {
+    const matched = accounts.find((account) => String(account.provider_account_id) === String(providerAccountId));
+    if (matched) {
+      return matched;
+    }
+  }
+
+  return accounts.find((account) => account.is_primary) || accounts[0] || null;
+}
+
+async function findAccountByProviderIdentity(provider, providerAccountId) {
+  if (!providerAccountId) {
+    return null;
+  }
+
+  return Account.findOne({
+    where: {
+      provider,
+      provider_account_id: providerAccountId
+    }
+  });
+}
+
+async function ensureProviderAccount(userId, provider, providerAccountId, profile = {}, tokens = null) {
+  const accountCount = await Account.count({
+    where: {
+      user_id: userId,
+      provider
+    }
+  });
+
+  const isPrimary = accountCount === 0;
+  const payload = {
+    user_id: userId,
+    provider,
+    provider_account_id: providerAccountId,
+    email: profile.email || null,
+    display_name: profile.name || null,
+    is_primary: isPrimary
+  };
+
+  if (tokens) {
+    payload.encrypted_access_token = encrypt(tokens.access_token);
+    if (tokens.refresh_token) {
+      payload.encrypted_refresh_token = encrypt(tokens.refresh_token);
+    }
+    payload.token_expiry = tokens.expiry_date || tokens.expires_at || null;
+  }
+
+  const existingAccount = await findAccountByProviderIdentity(provider, providerAccountId);
+
+  if (existingAccount) {
+    payload.is_primary = Boolean(existingAccount.is_primary);
+
+    if (String(existingAccount.user_id) !== String(userId)) {
+      const error = new Error(`This ${provider} account is already linked to another user.`);
+      error.statusCode = 409;
+      throw error;
+    }
+
+    return existingAccount.update(payload);
+  }
+
+  return Account.create(payload);
+}
+
+async function resolveAccountForTokens(userId, provider, providerAccountId = null) {
+  if (providerAccountId) {
+    const account = await Account.findOne({
+      where: {
+        user_id: userId,
+        provider,
+        provider_account_id: providerAccountId
+      }
+    });
+
+    if (account) {
+      return account;
+    }
+  }
+
+  return Account.findOne({
+    where: {
+      user_id: userId,
+      provider
+    },
+    order: [["is_primary", "DESC"], ["updatedAt", "DESC"], ["createdAt", "DESC"]]
+  });
+}
+
+async function getUserWithAccounts(userId) {
+  return User.findByPk(userId, {
+    include: [{
+      model: Account,
+      as: "accounts",
+      attributes: [
+        "id",
+        "provider",
+        "provider_account_id",
+        "email",
+        "display_name",
+        "is_primary",
+        "createdAt",
+        "updatedAt"
+      ]
+    }]
+  });
+}
+
+function hasProviderConnection(user, provider) {
+  const accounts = getUserAccountsForProvider(user, provider);
+  return accounts.length > 0;
+}
 
 /**
  * Returns a clean profile object without sensitive data
@@ -7,10 +136,13 @@ const { encrypt, decrypt } = require("../utils/tokenCrypto");
 function getCleanProfile(user) {
   if (!user) return null;
 
-  const gmailConnected = Boolean(
+  const gmailAccounts = getUserAccountsForProvider(user, "gmail");
+  const outlookAccounts = getUserAccountsForProvider(user, "outlook");
+
+  const gmailConnected = gmailAccounts.length > 0 || Boolean(
     user.encrypted_access_token || user.encrypted_refresh_token
   );
-  const outlookConnected = Boolean(
+  const outlookConnected = outlookAccounts.length > 0 || Boolean(
     user.encrypted_outlook_access_token || user.encrypted_outlook_refresh_token
   );
 
@@ -23,6 +155,24 @@ function getCleanProfile(user) {
     outlook_id: user.outlook_id || null,
     gmailConnected,
     outlookConnected,
+    accounts: [
+      ...gmailAccounts.map((account) => ({
+        id: account.id,
+        provider: account.provider,
+        provider_account_id: account.provider_account_id,
+        email: account.email || null,
+        display_name: account.display_name || null,
+        is_primary: Boolean(account.is_primary)
+      })),
+      ...outlookAccounts.map((account) => ({
+        id: account.id,
+        provider: account.provider,
+        provider_account_id: account.provider_account_id,
+        email: account.email || null,
+        display_name: account.display_name || null,
+        is_primary: Boolean(account.is_primary)
+      }))
+    ],
     createdAt: user.createdAt,
     updatedAt: user.updatedAt
   };
@@ -32,7 +182,7 @@ const userService = {
   getCleanProfile,
 
   hasGoogleConnection(user) {
-    return Boolean(
+    return hasProviderConnection(user, "gmail") || Boolean(
       user?.google_id ||
       user?.encrypted_access_token ||
       user?.encrypted_refresh_token
@@ -40,20 +190,23 @@ const userService = {
   },
 
   hasOutlookConnection(user) {
-    return Boolean(
+    return hasProviderConnection(user, "outlook") || Boolean(
       user?.outlook_id ||
       user?.encrypted_outlook_access_token ||
       user?.encrypted_outlook_refresh_token
     );
   },
 
+  getProviderAccount(user, provider, providerAccountId = null) {
+    return getPrimaryProviderAccount(user, provider, providerAccountId);
+  },
+
   async createOrUpdateGoogleUser(googleProfile, options = {}) {
     const { id, email, name } = googleProfile;
     const linkedUserId = options.linkedUserId || null;
 
-    let user = await User.findOne({
-      where: { google_id: id }
-    });
+    let account = await findAccountByProviderIdentity("gmail", id);
+    let user = account ? await User.findByPk(account.user_id) : null;
 
     if (!user && linkedUserId) {
       user = await User.findByPk(linkedUserId);
@@ -77,9 +230,16 @@ const userService = {
       }
     }
 
+    if (account && user && String(account.user_id) !== String(user.id)) {
+      const error = new Error("This Gmail account is already linked to another user.");
+      error.statusCode = 409;
+      throw error;
+    }
+
     if (user) {
       const updateFields = {
-        google_id: id
+        name: user.name,
+        email: user.email
       };
 
       if (!linkedUserId) {
@@ -94,20 +254,31 @@ const userService = {
       user = await User.create({
         name,
         email,
-        google_id: id
       });
     }
 
-    return user;
+    account = await ensureProviderAccount(user.id, "gmail", id, { email, name }, null);
+
+    if (!account.is_primary) {
+      const providerAccounts = await Account.findAll({
+        where: { user_id: user.id, provider: "gmail" },
+        order: [["createdAt", "ASC"]]
+      });
+
+      if (providerAccounts.length === 1) {
+        await providerAccounts[0].update({ is_primary: true });
+      }
+    }
+
+    return getUserWithAccounts(user.id);
   },
 
   async createOrUpdateOutlookUser(outlookProfile, options = {}) {
     const { id, email, name } = outlookProfile;
     const linkedUserId = options.linkedUserId || null;
 
-    let user = await User.findOne({
-      where: { outlook_id: id }
-    });
+    let account = await findAccountByProviderIdentity("outlook", id);
+    let user = account ? await User.findByPk(account.user_id) : null;
 
     if (!user && linkedUserId) {
       user = await User.findByPk(linkedUserId);
@@ -131,9 +302,14 @@ const userService = {
       }
     }
 
+    if (account && user && String(account.user_id) !== String(user.id)) {
+      const error = new Error("This Outlook account is already linked to another user.");
+      error.statusCode = 409;
+      throw error;
+    }
+
     if (user) {
       const updateFields = {
-        outlook_id: id,
         outlook_email: email
       };
 
@@ -149,16 +325,28 @@ const userService = {
       user = await User.create({
         name,
         email,
-        outlook_email: email,
-        outlook_id: id
+        outlook_email: email
       });
     }
 
-    return user;
+    account = await ensureProviderAccount(user.id, "outlook", id, { email, name }, null);
+
+    if (!account.is_primary) {
+      const providerAccounts = await Account.findAll({
+        where: { user_id: user.id, provider: "outlook" },
+        order: [["createdAt", "ASC"]]
+      });
+
+      if (providerAccounts.length === 1) {
+        await providerAccounts[0].update({ is_primary: true });
+      }
+    }
+
+    return getUserWithAccounts(user.id);
   },
 
   async getUserById(userId) {
-    const user = await User.findByPk(userId);
+    const user = await getUserWithAccounts(userId);
 
     if (!user) {
       throw new Error("User not found");
@@ -168,7 +356,23 @@ const userService = {
   },
 
   async getUserByEmailAddress(email) {
-    const user = await User.findOne({ where: { email } });
+    const user = await User.findOne({
+      where: { email },
+      include: [{
+        model: Account,
+        as: "accounts",
+        attributes: [
+          "id",
+          "provider",
+          "provider_account_id",
+          "email",
+          "display_name",
+          "is_primary",
+          "createdAt",
+          "updatedAt"
+        ]
+      }]
+    });
 
     if (!user) {
       throw new Error("User not found");
@@ -182,6 +386,15 @@ const userService = {
    * Call this wherever the raw token values are needed.
    */
   decryptTokens(user) {
+    const providerAccount = getPrimaryProviderAccount(user, "gmail");
+
+    if (providerAccount) {
+      return {
+        accessToken: decrypt(providerAccount.encrypted_access_token),
+        refreshToken: decrypt(providerAccount.encrypted_refresh_token)
+      };
+    }
+
     return {
       accessToken: decrypt(user.encrypted_access_token),
       refreshToken: decrypt(user.encrypted_refresh_token)
@@ -189,32 +402,107 @@ const userService = {
   },
 
   decryptOutlookTokens(user) {
+    const providerAccount = getPrimaryProviderAccount(user, "outlook");
+
+    if (providerAccount) {
+      return {
+        accessToken: decrypt(providerAccount.encrypted_access_token),
+        refreshToken: decrypt(providerAccount.encrypted_refresh_token)
+      };
+    }
+
     return {
       accessToken: decrypt(user.encrypted_outlook_access_token),
       refreshToken: decrypt(user.encrypted_outlook_refresh_token)
     };
   },
 
-  async saveTokens(userId, tokens) {
+  decryptProviderTokens(user, provider, providerAccountId = null) {
+    const providerAccount = getPrimaryProviderAccount(user, provider, providerAccountId);
+
+    if (providerAccount) {
+      return {
+        accessToken: decrypt(providerAccount.encrypted_access_token),
+        refreshToken: decrypt(providerAccount.encrypted_refresh_token),
+        tokenExpiry: providerAccount.token_expiry || null,
+        account: providerAccount
+      };
+    }
+
+    if (String(provider).trim().toLowerCase() === "outlook") {
+      return {
+        accessToken: decrypt(user.encrypted_outlook_access_token),
+        refreshToken: decrypt(user.encrypted_outlook_refresh_token),
+        tokenExpiry: user.outlook_token_expiry || null,
+        account: null
+      };
+    }
+
+    return {
+      accessToken: decrypt(user.encrypted_access_token),
+      refreshToken: decrypt(user.encrypted_refresh_token),
+      tokenExpiry: user.token_expiry || null,
+      account: null
+    };
+  },
+
+  async saveTokens(userId, tokens, options = {}) {
+    const provider = String(options.provider || "gmail").trim().toLowerCase();
+    const providerAccountId = options.providerAccountId || null;
+    const account = await resolveAccountForTokens(userId, provider, providerAccountId);
+
+    if (account) {
+      const updateFields = {
+        encrypted_access_token: encrypt(tokens.access_token),
+        token_expiry: tokens.expiry_date || tokens.expires_at || null
+      };
+
+      if (tokens.refresh_token) {
+        updateFields.encrypted_refresh_token = encrypt(tokens.refresh_token);
+      }
+
+      return account.update(updateFields);
+    }
+
     const user = await User.findByPk(userId);
 
     if (!user) {
       throw new Error("User not found");
     }
 
-    // Only overwrite refresh_token when Google issues a new one
-    // (it is absent on subsequent refreshes to preserve the stored value)
     const updateFields = {
       encrypted_access_token: encrypt(tokens.access_token),
       token_expiry: tokens.expiry_date
     };
+
     if (tokens.refresh_token) {
       updateFields.encrypted_refresh_token = encrypt(tokens.refresh_token);
     }
+
     return user.update(updateFields);
   },
 
-  async saveOutlookTokens(userId, tokens) {
+  async saveOutlookTokens(userId, tokens, options = {}) {
+    const providerAccountId = options.providerAccountId || null;
+    const account = await resolveAccountForTokens(userId, "outlook", providerAccountId);
+
+    if (account) {
+      const expiresAt =
+        tokens.expires_at ||
+        (tokens.expires_in ? new Date(Date.now() + Number(tokens.expires_in) * 1000) : null);
+
+      const updateFields = {
+        encrypted_access_token: encrypt(tokens.access_token),
+        token_expiry: expiresAt
+      };
+
+      if (tokens.refresh_token) {
+        updateFields.encrypted_refresh_token = encrypt(tokens.refresh_token);
+      }
+
+      return account.update(updateFields);
+    }
+
     const user = await User.findByPk(userId);
 
     if (!user) {

@@ -108,6 +108,10 @@ function setTokenCookie(res, token) {
   });
 }
 
+function getProviderAccount(user, provider, providerAccountId = null) {
+  return userService.getProviderAccount(user, provider, providerAccountId);
+}
+
 function ensureOutlookConfig() {
   if (!OUTLOOK_CLIENT_ID || !OUTLOOK_CLIENT_SECRET || !OUTLOOK_REDIRECT_URI) {
     const missing = [
@@ -249,9 +253,13 @@ const outlookService = {
         linkedUserId
       });
 
-      await userService.saveOutlookTokens(user.id, tokens);
+      const account = getProviderAccount(user, "outlook", me.id);
 
-      const fetchResult = await outlookService.fetchEmailsFromOutlook(user.id, tokens.access_token);
+      await userService.saveOutlookTokens(user.id, tokens, {
+        providerAccountId: me.id
+      });
+
+      const fetchResult = await outlookService.fetchEmailsFromOutlook(user.id, tokens.access_token, account?.id || null);
 
       const jwtToken = jwt.sign(
         { userId: user.id },
@@ -300,14 +308,17 @@ const outlookService = {
       }
 
       const user = await userService.getUserById(userId);
+      const account = getProviderAccount(user, "outlook");
 
-      if (!user.encrypted_outlook_refresh_token) {
+      const providerTokens = userService.decryptProviderTokens(user, "outlook", account?.provider_account_id);
+
+      if (!providerTokens.accessToken || !providerTokens.refreshToken) {
         return res.status(401).json({
           error: "No Outlook refresh token on file. Please log in again via /outlook/login."
         });
       }
 
-      const { refreshToken } = userService.decryptOutlookTokens(user);
+      const { refreshToken } = providerTokens;
 
       const tokens = await postForm(TOKEN_URL, {
         client_id: OUTLOOK_CLIENT_ID,
@@ -321,6 +332,8 @@ const outlookService = {
       await userService.saveOutlookTokens(user.id, {
         ...tokens,
         refresh_token: tokens.refresh_token || refreshToken
+      }, {
+        providerAccountId: account?.provider_account_id || null
       });
 
       const newJwt = jwt.sign(
@@ -347,15 +360,18 @@ const outlookService = {
     try {
       const { userId } = req.params;
       const user = await userService.getUserById(userId);
+      const account = getProviderAccount(user, "outlook");
 
-      if (!user.encrypted_outlook_access_token) {
+      const tokens = userService.decryptProviderTokens(user, "outlook", account?.provider_account_id);
+
+      if (!tokens.accessToken || !tokens.refreshToken) {
         return res.status(401).json({
           error: "User not authenticated with Outlook"
         });
       }
 
-      const { accessToken } = userService.decryptOutlookTokens(user);
-      const fetchResult = await outlookService.fetchEmailsFromOutlook(user.id, accessToken);
+      const { accessToken } = tokens;
+      const fetchResult = await outlookService.fetchEmailsFromOutlook(user.id, accessToken, account?.id || null);
 
       return res.json({
         message: "Outlook emails fetched successfully",
@@ -369,7 +385,7 @@ const outlookService = {
     }
   },
 
-  async fetchEmailsFromOutlook(userId, accessToken) {
+  async fetchEmailsFromOutlook(userId, accessToken, accountId = null) {
     const recentDays = getOutlookRecentDays();
     const filter = encodeURIComponent(buildOutlookRecentFilter(recentDays));
     const query = [
@@ -388,6 +404,7 @@ const outlookService = {
       const exists = await Email.findOne({
         where: {
           user_id: userId,
+          ...(accountId ? { account_id: accountId } : {}),
           mail_msg_id: message.id,
           provider: "outlook"
         }
@@ -395,6 +412,7 @@ const outlookService = {
       const { senderEmail, senderName } = parseSender(message.from);
 
       const payload = {
+        account_id: accountId,
         mail_thread_id: message.conversationId || null,
         subject: message.subject || "",
         snippet: message.bodyPreview || "",
@@ -424,6 +442,7 @@ const outlookService = {
 
       const email = await Email.create({
         user_id: userId,
+        account_id: accountId,
         provider: "outlook",
         mail_msg_id: message.id,
         ...payload
@@ -433,7 +452,7 @@ const outlookService = {
       emailsToAnalyze.push(email);
     }
 
-    const unreadSync = await outlookService.syncUnreadStatuses(userId, accessToken);
+    const unreadSync = await outlookService.syncUnreadStatuses(userId, accessToken, accountId);
 
     const prioritySync = {
       attempted: emailsToAnalyze.length,
@@ -478,13 +497,19 @@ const outlookService = {
     };
   },
 
-  async syncUnreadStatuses(userId, accessToken) {
+  async syncUnreadStatuses(userId, accessToken, accountId = null) {
+    const where = {
+      user_id: userId,
+      provider: "outlook",
+      is_read: false
+    };
+
+    if (accountId) {
+      where.account_id = accountId;
+    }
+
     const unreadEmails = await Email.findAll({
-      where: {
-        user_id: userId,
-        provider: "outlook",
-        is_read: false
-      },
+      where,
       attributes: ["id", "mail_msg_id"]
     });
 

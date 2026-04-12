@@ -1,5 +1,5 @@
 const { google } = require("googleapis");
-const { Email, Label, EmailPriority } = require("../models");
+const { Email, Label, EmailPriority, Account } = require("../models");
 const userService = require("./userservice");
 const priorityService = require("./priorityservice");
 const sseService = require("./sseservice");
@@ -99,6 +99,10 @@ function getGmailRecentDays() {
   return Math.min(Math.max(Math.floor(configured), 1), 2);
 }
 
+function getProviderAccount(user, provider, providerAccountId = null) {
+  return userService.getProviderAccount(user, provider, providerAccountId);
+}
+
 const gmailService = {
   /**
    * Issues a fresh JWT without requiring a new Google OAuth login.
@@ -114,19 +118,22 @@ const gmailService = {
       }
 
       const user = await userService.getUserById(userId);
+      const account = getProviderAccount(user, "gmail");
 
-      if (!user.encrypted_refresh_token) {
+      const tokens = userService.decryptProviderTokens(user, "gmail", account?.provider_account_id);
+
+      if (!tokens.accessToken || !tokens.refreshToken) {
         return res.status(401).json({
           error: "No Google refresh token on file. Please log in again via /gmail/login."
         });
       }
 
       // Verify the Google refresh token is still valid
-      const { accessToken: at, refreshToken: rt } = userService.decryptTokens(user);
+      const { accessToken: at, refreshToken: rt, tokenExpiry } = tokens;
       const oauth2Client = gmailService.createOAuthClient(
         at,
         rt,
-        user.token_expiry
+        tokenExpiry
       );
 
       let newGoogleTokens;
@@ -141,7 +148,10 @@ const gmailService = {
       }
 
       // Persist refreshed Google tokens
-      await userService.saveTokens(user.id, newGoogleTokens);
+      await userService.saveTokens(user.id, newGoogleTokens, {
+        provider: "gmail",
+        providerAccountId: account?.provider_account_id || null
+      });
 
       // Issue a fresh app JWT
       const newJwt = jwt.sign(
@@ -199,18 +209,19 @@ const gmailService = {
 
   async getGmailClientForUser(userId) {
     const user = await userService.getUserById(userId);
+    const account = getProviderAccount(user, "gmail");
 
-    if (!user.encrypted_access_token) {
+    const { accessToken, refreshToken, tokenExpiry } = userService.decryptProviderTokens(user, "gmail", account?.provider_account_id);
+
+    if (!accessToken || !refreshToken) {
       const error = new Error("User not authenticated");
       error.statusCode = 401;
       throw error;
     }
-
-    const { accessToken, refreshToken } = userService.decryptTokens(user);
     const oauth2Client = gmailService.createOAuthClient(
       accessToken,
       refreshToken,
-      user.token_expiry
+      tokenExpiry
     );
 
     const gmail = google.gmail({
@@ -218,7 +229,7 @@ const gmailService = {
       auth: oauth2Client
     });
 
-    return { user, gmail };
+    return { user, gmail, account };
   },
 
   async streamUserEmails(req, res) {
@@ -321,13 +332,22 @@ const gmailService = {
         linkedUserId
       });
 
-      await userService.saveTokens(user.id, tokens);
+      const account = getProviderAccount(user, "gmail", googleUser.id);
+
+      await userService.saveTokens(user.id, tokens, {
+        provider: "gmail",
+        providerAccountId: googleUser.id
+      });
 
       const fetchResult = await gmailService.fetchEmailsFromGmail(
         user.id,
         tokens.access_token,
         tokens.refresh_token,
-        tokens.expiry_date
+        tokens.expiry_date,
+        {
+          accountId: account?.id || null,
+          providerAccountId: googleUser.id
+        }
       );
 
       // Best effort: start watch automatically after OAuth completes.
@@ -393,20 +413,17 @@ const gmailService = {
   async getNewMails(req, res) {
     try {
       const { userId } = req.params;
-      const user = await userService.getUserById(userId);
+      const { user, account, gmail } = await gmailService.getGmailClientForUser(userId);
 
-      if (!user.encrypted_access_token) {
-        return res.status(401).json({
-          error: "User not authenticated"
-        });
-      }
-
-      const { accessToken, refreshToken } = userService.decryptTokens(user);
       const fetchResult = await gmailService.fetchEmailsFromGmail(
         user.id,
-        accessToken,
-        refreshToken,
-        user.token_expiry
+        gmail.auth.credentials.access_token,
+        gmail.auth.credentials.refresh_token,
+        gmail.auth.credentials.expiry_date,
+        {
+          accountId: account?.id || null,
+          providerAccountId: account?.provider_account_id || null
+        }
       );
 
       return res.json({
@@ -500,21 +517,37 @@ const gmailService = {
         });
       }
 
-      const user = await userService.getUserByEmailAddress(emailAddress);
+      const account = await Account.findOne({
+        where: {
+          provider: "gmail",
+          email: emailAddress
+        }
+      });
 
-      if (!user.encrypted_access_token) {
+      const user = account
+        ? await userService.getUserById(account.user_id)
+        : await userService.getUserByEmailAddress(emailAddress);
+
+      const providerAccount = account || getProviderAccount(user, "gmail");
+      const tokens = userService.decryptProviderTokens(user, "gmail", providerAccount?.provider_account_id);
+
+      if (!tokens.accessToken || !tokens.refreshToken) {
         return res.status(200).json({
           message: "User has no valid token",
           emailAddress
         });
       }
 
-      const { accessToken, refreshToken } = userService.decryptTokens(user);
+      const { accessToken, refreshToken, tokenExpiry } = tokens;
       const fetchResult = await gmailService.fetchEmailsFromGmail(
         user.id,
         accessToken,
         refreshToken,
-        user.token_expiry
+        tokenExpiry,
+        {
+          accountId: providerAccount?.id || null,
+          providerAccountId: providerAccount?.provider_account_id || null
+        }
       );
 
       return res.status(200).json({
@@ -533,7 +566,8 @@ const gmailService = {
     }
   },
 
-  async fetchEmailsFromGmail(userId, accessToken, refreshToken, tokenExpiry) {
+  async fetchEmailsFromGmail(userId, accessToken, refreshToken, tokenExpiry, options = {}) {
+    const accountId = options.accountId || null;
     const oauth2Client = gmailService.createOAuthClient(
       accessToken,
       refreshToken,
@@ -588,16 +622,23 @@ const gmailService = {
       const senderName = fromMatch ? (fromMatch[1] || fromMatch[3] || "") : "";
       const senderEmail = fromMatch ? (fromMatch[2] || fromMatch[3] || "") : "";
 
+      const existsWhere = {
+        user_id: userId,
+        provider: "gmail",
+        mail_msg_id: message.id
+      };
+
+      if (accountId) {
+        existsWhere.account_id = accountId;
+      }
+
       const exists = await Email.findOne({
-        where: {
-          user_id: userId,
-          provider: "gmail",
-          mail_msg_id: message.id
-        }
+        where: existsWhere
       });
 
       if (exists) {
         await exists.update({
+          account_id: accountId,
           provider: "gmail",
           mail_thread_id: msg.data.threadId,
           subject,
@@ -624,6 +665,7 @@ const gmailService = {
 
       const email = await Email.create({
         user_id: userId,
+        account_id: accountId,
         provider: "gmail",
         mail_msg_id: message.id,
         mail_thread_id: msg.data.threadId,
@@ -642,7 +684,7 @@ const gmailService = {
       emailsToAnalyze.push(email);
     }
 
-    const unreadSync = await gmailService.syncUnreadStatuses(userId, gmail);
+    const unreadSync = await gmailService.syncUnreadStatuses(userId, gmail, accountId);
 
     const prioritySync = {
       attempted: emailsToAnalyze.length,
@@ -686,13 +728,19 @@ const gmailService = {
     };
   },
 
-  async syncUnreadStatuses(userId, gmailClient) {
+  async syncUnreadStatuses(userId, gmailClient, accountId = null) {
+    const where = {
+      user_id: userId,
+      provider: "gmail",
+      is_read: false
+    };
+
+    if (accountId) {
+      where.account_id = accountId;
+    }
+
     const unreadEmails = await Email.findAll({
-      where: {
-        user_id: userId,
-        provider: "gmail",
-        is_read: false
-      },
+      where,
       attributes: ["id", "mail_msg_id"]
     });
 
