@@ -1,4 +1,5 @@
-const { User, Account } = require("../models");
+const { Op } = require("sequelize");
+const { User, Account, Email, EmailPriority, EmailLabel, EmailProcessingLog, sequelize } = require("../models");
 const { encrypt, decrypt } = require("../utils/tokenCrypto");
 
 function getUserAccounts(user) {
@@ -24,6 +25,47 @@ function getPrimaryProviderAccount(user, provider, providerAccountId = null) {
   }
 
   return accounts.find((account) => account.is_primary) || accounts[0] || null;
+}
+
+function getPrimaryEmail(user) {
+  const accounts = getUserAccounts(user);
+  const primaryAccount = accounts.find((account) => account.is_primary) || accounts[0] || null;
+
+  return primaryAccount?.email || user?.email || null;
+}
+
+function getDisplayName(user) {
+  const accounts = getUserAccounts(user);
+  const primaryAccount = accounts.find((account) => account.is_primary) || accounts[0] || null;
+  const accountName = primaryAccount?.display_name || primaryAccount?.email?.split("@")[0] || null;
+  const rawName = String(user?.name || "").trim();
+
+  if (rawName && rawName.toLowerCase() !== "user") {
+    return rawName;
+  }
+
+  return accountName || rawName || "User";
+}
+
+async function getUserByLinkedEmail(email) {
+  if (!email) {
+    return null;
+  }
+
+  const account = await Account.findOne({
+    where: { email }
+  });
+
+  if (account) {
+    return getUserWithAccounts(account.user_id);
+  }
+
+  const user = await User.findOne({ where: { email } });
+  if (!user) {
+    return null;
+  }
+
+  return getUserWithAccounts(user.id);
 }
 
 async function findAccountByProviderIdentity(provider, providerAccountId) {
@@ -136,43 +178,27 @@ function hasProviderConnection(user, provider) {
 function getCleanProfile(user) {
   if (!user) return null;
 
+  const allAccounts = getUserAccounts(user);
   const gmailAccounts = getUserAccountsForProvider(user, "gmail");
   const outlookAccounts = getUserAccountsForProvider(user, "outlook");
 
-  const gmailConnected = gmailAccounts.length > 0 || Boolean(
-    user.encrypted_access_token || user.encrypted_refresh_token
-  );
-  const outlookConnected = outlookAccounts.length > 0 || Boolean(
-    user.encrypted_outlook_access_token || user.encrypted_outlook_refresh_token
-  );
+  const gmailConnected = gmailAccounts.length > 0;
+  const outlookConnected = outlookAccounts.length > 0;
 
   return {
     id: user.id,
-    name: user.name,
-    email: user.email,
-    outlook_email: user.outlook_email || null,
-    google_id: user.google_id || null,
-    outlook_id: user.outlook_id || null,
+    name: getDisplayName(user),
+    email: getPrimaryEmail(user),
     gmailConnected,
     outlookConnected,
-    accounts: [
-      ...gmailAccounts.map((account) => ({
-        id: account.id,
-        provider: account.provider,
-        provider_account_id: account.provider_account_id,
-        email: account.email || null,
-        display_name: account.display_name || null,
-        is_primary: Boolean(account.is_primary)
-      })),
-      ...outlookAccounts.map((account) => ({
-        id: account.id,
-        provider: account.provider,
-        provider_account_id: account.provider_account_id,
-        email: account.email || null,
-        display_name: account.display_name || null,
-        is_primary: Boolean(account.is_primary)
-      }))
-    ],
+    accounts: allAccounts.map((account) => ({
+      id: account.id,
+      provider: account.provider,
+      provider_account_id: account.provider_account_id,
+      email: account.email || null,
+      display_name: account.display_name || null,
+      is_primary: Boolean(account.is_primary)
+    })),
     createdAt: user.createdAt,
     updatedAt: user.updatedAt
   };
@@ -182,19 +208,11 @@ const userService = {
   getCleanProfile,
 
   hasGoogleConnection(user) {
-    return hasProviderConnection(user, "gmail") || Boolean(
-      user?.google_id ||
-      user?.encrypted_access_token ||
-      user?.encrypted_refresh_token
-    );
+    return hasProviderConnection(user, "gmail");
   },
 
   hasOutlookConnection(user) {
-    return hasProviderConnection(user, "outlook") || Boolean(
-      user?.outlook_id ||
-      user?.encrypted_outlook_access_token ||
-      user?.encrypted_outlook_refresh_token
-    );
+    return hasProviderConnection(user, "outlook");
   },
 
   getProviderAccount(user, provider, providerAccountId = null) {
@@ -213,15 +231,15 @@ const userService = {
     }
 
     if (!user && email) {
-      const emailUser = await User.findOne({ where: { email } });
+      const emailUserWithAccounts = await getUserByLinkedEmail(email);
 
-      if (emailUser) {
-        const emailUserHasGoogle = userService.hasGoogleConnection(emailUser);
-        const emailUserHasOutlook = userService.hasOutlookConnection(emailUser);
+      if (emailUserWithAccounts) {
+        const emailUserHasGoogle = userService.hasGoogleConnection(emailUserWithAccounts);
+        const emailUserHasOutlook = userService.hasOutlookConnection(emailUserWithAccounts);
 
         // Auto-link by email only for local-only accounts.
         if (!emailUserHasGoogle && !emailUserHasOutlook) {
-          user = emailUser;
+          user = emailUserWithAccounts;
         } else {
           const error = new Error("This email is already linked to another provider. Sign in first and connect Gmail from Settings.");
           error.statusCode = 409;
@@ -239,7 +257,7 @@ const userService = {
     if (user) {
       const updateFields = {
         name: user.name,
-        email: user.email
+        email: getPrimaryEmail(user)
       };
 
       if (!linkedUserId) {
@@ -285,15 +303,15 @@ const userService = {
     }
 
     if (!user && email) {
-      const emailUser = await User.findOne({ where: { email } });
+      const emailUserWithAccounts = await getUserByLinkedEmail(email);
 
-      if (emailUser) {
-        const emailUserHasGoogle = userService.hasGoogleConnection(emailUser);
-        const emailUserHasOutlook = userService.hasOutlookConnection(emailUser);
+      if (emailUserWithAccounts) {
+        const emailUserHasGoogle = userService.hasGoogleConnection(emailUserWithAccounts);
+        const emailUserHasOutlook = userService.hasOutlookConnection(emailUserWithAccounts);
 
         // Auto-link by email only for local-only accounts.
         if (!emailUserHasGoogle && !emailUserHasOutlook) {
-          user = emailUser;
+          user = emailUserWithAccounts;
         } else {
           const error = new Error("This email is already linked to another provider. Sign in first and connect Outlook from Settings.");
           error.statusCode = 409;
@@ -309,9 +327,7 @@ const userService = {
     }
 
     if (user) {
-      const updateFields = {
-        outlook_email: email
-      };
+      const updateFields = {};
 
       if (!linkedUserId) {
         updateFields.name = name;
@@ -324,8 +340,7 @@ const userService = {
     } else {
       user = await User.create({
         name,
-        email,
-        outlook_email: email
+        email
       });
     }
 
@@ -356,23 +371,7 @@ const userService = {
   },
 
   async getUserByEmailAddress(email) {
-    const user = await User.findOne({
-      where: { email },
-      include: [{
-        model: Account,
-        as: "accounts",
-        attributes: [
-          "id",
-          "provider",
-          "provider_account_id",
-          "email",
-          "display_name",
-          "is_primary",
-          "createdAt",
-          "updatedAt"
-        ]
-      }]
-    });
+    const user = await getUserByLinkedEmail(email);
 
     if (!user) {
       throw new Error("User not found");
@@ -388,61 +387,29 @@ const userService = {
   decryptTokens(user) {
     const providerAccount = getPrimaryProviderAccount(user, "gmail");
 
-    if (providerAccount) {
-      return {
-        accessToken: decrypt(providerAccount.encrypted_access_token),
-        refreshToken: decrypt(providerAccount.encrypted_refresh_token)
-      };
-    }
-
     return {
-      accessToken: decrypt(user.encrypted_access_token),
-      refreshToken: decrypt(user.encrypted_refresh_token)
+      accessToken: decrypt(providerAccount?.encrypted_access_token),
+      refreshToken: decrypt(providerAccount?.encrypted_refresh_token)
     };
   },
 
   decryptOutlookTokens(user) {
     const providerAccount = getPrimaryProviderAccount(user, "outlook");
 
-    if (providerAccount) {
-      return {
-        accessToken: decrypt(providerAccount.encrypted_access_token),
-        refreshToken: decrypt(providerAccount.encrypted_refresh_token)
-      };
-    }
-
     return {
-      accessToken: decrypt(user.encrypted_outlook_access_token),
-      refreshToken: decrypt(user.encrypted_outlook_refresh_token)
+      accessToken: decrypt(providerAccount?.encrypted_access_token),
+      refreshToken: decrypt(providerAccount?.encrypted_refresh_token)
     };
   },
 
   decryptProviderTokens(user, provider, providerAccountId = null) {
     const providerAccount = getPrimaryProviderAccount(user, provider, providerAccountId);
 
-    if (providerAccount) {
-      return {
-        accessToken: decrypt(providerAccount.encrypted_access_token),
-        refreshToken: decrypt(providerAccount.encrypted_refresh_token),
-        tokenExpiry: providerAccount.token_expiry || null,
-        account: providerAccount
-      };
-    }
-
-    if (String(provider).trim().toLowerCase() === "outlook") {
-      return {
-        accessToken: decrypt(user.encrypted_outlook_access_token),
-        refreshToken: decrypt(user.encrypted_outlook_refresh_token),
-        tokenExpiry: user.outlook_token_expiry || null,
-        account: null
-      };
-    }
-
     return {
-      accessToken: decrypt(user.encrypted_access_token),
-      refreshToken: decrypt(user.encrypted_refresh_token),
-      tokenExpiry: user.token_expiry || null,
-      account: null
+      accessToken: decrypt(providerAccount?.encrypted_access_token),
+      refreshToken: decrypt(providerAccount?.encrypted_refresh_token),
+      tokenExpiry: providerAccount?.token_expiry || null,
+      account: providerAccount || null
     };
   },
 
@@ -451,62 +418,28 @@ const userService = {
     const providerAccountId = options.providerAccountId || null;
     const account = await resolveAccountForTokens(userId, provider, providerAccountId);
 
-    if (account) {
-      const updateFields = {
-        encrypted_access_token: encrypt(tokens.access_token),
-        token_expiry: tokens.expiry_date || tokens.expires_at || null
-      };
-
-      if (tokens.refresh_token) {
-        updateFields.encrypted_refresh_token = encrypt(tokens.refresh_token);
-      }
-
-      return account.update(updateFields);
-    }
-
-    const user = await User.findByPk(userId);
-
-    if (!user) {
-      throw new Error("User not found");
+    if (!account) {
+      throw new Error(`No ${provider} account found for user ${userId}`);
     }
 
     const updateFields = {
       encrypted_access_token: encrypt(tokens.access_token),
-      token_expiry: tokens.expiry_date
+      token_expiry: tokens.expiry_date || tokens.expires_at || null
     };
 
     if (tokens.refresh_token) {
       updateFields.encrypted_refresh_token = encrypt(tokens.refresh_token);
     }
 
-    return user.update(updateFields);
+    return account.update(updateFields);
   },
 
   async saveOutlookTokens(userId, tokens, options = {}) {
     const providerAccountId = options.providerAccountId || null;
     const account = await resolveAccountForTokens(userId, "outlook", providerAccountId);
 
-    if (account) {
-      const expiresAt =
-        tokens.expires_at ||
-        (tokens.expires_in ? new Date(Date.now() + Number(tokens.expires_in) * 1000) : null);
-
-      const updateFields = {
-        encrypted_access_token: encrypt(tokens.access_token),
-        token_expiry: expiresAt
-      };
-
-      if (tokens.refresh_token) {
-        updateFields.encrypted_refresh_token = encrypt(tokens.refresh_token);
-      }
-
-      return account.update(updateFields);
-    }
-
-    const user = await User.findByPk(userId);
-
-    if (!user) {
-      throw new Error("User not found");
+    if (!account) {
+      throw new Error(`No outlook account found for user ${userId}`);
     }
 
     const expiresAt =
@@ -514,15 +447,15 @@ const userService = {
       (tokens.expires_in ? new Date(Date.now() + Number(tokens.expires_in) * 1000) : null);
 
     const updateFields = {
-      encrypted_outlook_access_token: encrypt(tokens.access_token),
-      outlook_token_expiry: expiresAt
+      encrypted_access_token: encrypt(tokens.access_token),
+      token_expiry: expiresAt
     };
 
     if (tokens.refresh_token) {
-      updateFields.encrypted_outlook_refresh_token = encrypt(tokens.refresh_token);
+      updateFields.encrypted_refresh_token = encrypt(tokens.refresh_token);
     }
 
-    return user.update(updateFields);
+    return account.update(updateFields);
   },
 
   async create(req, res) {
@@ -581,19 +514,19 @@ const userService = {
     try {
       const { email } = req.params;
 
-      const user = await User.findOne({ where: { email } });
-
-      if (!user) {
-        return res.status(404).json({
-          error: "User not found"
-        });
-      }
+      const user = await userService.getUserByEmailAddress(email);
 
       return res.json({
         message: "User retrieved successfully",
         data: getCleanProfile(user)
       });
     } catch (error) {
+      if (error.message === "User not found") {
+        return res.status(404).json({
+          error: "User not found"
+        });
+      }
+
       return res.status(500).json({
         error: "Failed to fetch user"
       });
@@ -758,13 +691,13 @@ const userService = {
   async delete(req, res) {
     try {
       const { userId } = req.params;
-       const requestedBy = String(req.userId || "");
+      const requestedBy = String(req.userId || "");
 
-       if (String(userId) !== requestedBy) {
-         return res.status(403).json({
-           error: "Forbidden: you can only delete your own account"
-         });
-       }
+      if (String(userId) !== requestedBy) {
+        return res.status(403).json({
+          error: "Forbidden: you can only delete your own account"
+        });
+      }
 
       const user = await User.findByPk(userId);
 
@@ -777,11 +710,100 @@ const userService = {
       await user.destroy();
 
       return res.json({
-         message: "User account deleted successfully"
+        message: "User account deleted successfully"
       });
     } catch (error) {
       return res.status(500).json({
-         error: error.message || "Failed to delete user"
+        error: error.message || "Failed to delete user"
+      });
+    }
+  },
+
+  async disconnectAccount(req, res) {
+    try {
+      const { userId, accountId } = req.params;
+      const requestedBy = String(req.userId || "");
+
+      if (String(userId) !== requestedBy) {
+        return res.status(403).json({
+          error: "Forbidden: you can only disconnect your own connected accounts"
+        });
+      }
+
+      const result = await sequelize.transaction(async (transaction) => {
+        const account = await Account.findOne({
+          where: {
+            id: accountId,
+            user_id: userId
+          },
+          transaction
+        });
+
+        if (!account) {
+          const error = new Error("Connected account not found");
+          error.statusCode = 404;
+          throw error;
+        }
+
+        if (String(account.provider || "").trim().toLowerCase() === "local") {
+          const error = new Error("Primary local account cannot be disconnected.");
+          error.statusCode = 400;
+          throw error;
+        }
+
+        const emailRows = await Email.findAll({
+          where: {
+            user_id: userId,
+            account_id: account.id
+          },
+          attributes: ["id"],
+          transaction
+        });
+
+        const emailIds = emailRows.map((email) => email.id);
+
+        if (emailIds.length > 0) {
+          await EmailLabel.destroy({ where: { email_id: { [Op.in]: emailIds } }, transaction });
+          await EmailProcessingLog.destroy({ where: { email_id: { [Op.in]: emailIds } }, transaction });
+          await EmailPriority.destroy({ where: { email_id: { [Op.in]: emailIds } }, transaction });
+          await Email.destroy({ where: { id: { [Op.in]: emailIds } }, transaction });
+        }
+
+        await account.destroy({ transaction });
+
+        const updatedUser = await User.findByPk(userId, {
+          include: [{
+            model: Account,
+            as: "accounts",
+            attributes: [
+              "id",
+              "provider",
+              "provider_account_id",
+              "email",
+              "display_name",
+              "is_primary",
+              "createdAt",
+              "updatedAt"
+            ]
+          }],
+          transaction
+        });
+
+        return {
+          deletedAccount: account,
+          deletedEmails: emailIds.length,
+          user: updatedUser
+        };
+      });
+
+      return res.json({
+        message: "Connected account disconnected successfully.",
+        deletedEmails: result.deletedEmails,
+        data: getCleanProfile(result.user)
+      });
+    } catch (error) {
+      return res.status(error.statusCode || 500).json({
+        error: error.message || "Failed to disconnect connected account"
       });
     }
   }

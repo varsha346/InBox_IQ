@@ -1,31 +1,56 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const { User } = require("../models");
+const { User, Account } = require("../models");
 const userService = require("./userservice");
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
 const SALT_ROUNDS = 12;
 
+function getTokenMaxAgeMs() {
+  const raw = String(JWT_EXPIRES_IN || "").trim().toLowerCase();
+  const match = raw.match(/^(\d+)([smhd])$/);
+
+  if (match) {
+    const value = Number(match[1]);
+    const unit = match[2];
+
+    if (unit === "s") return value * 1000;
+    if (unit === "m") return value * 60 * 1000;
+    if (unit === "h") return value * 60 * 60 * 1000;
+    if (unit === "d") return value * 24 * 60 * 60 * 1000;
+  }
+
+  if (/^\d+$/.test(raw)) {
+    // jsonwebtoken treats numeric expiresIn as seconds.
+    return Number(raw) * 1000;
+  }
+
+  return 7 * 24 * 60 * 60 * 1000;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function generateToken(user) {
+  const profileEmail = userService.getCleanProfile(user)?.email || user.email;
+
   return jwt.sign(
-    { userId: user.id, email: user.email },
+    { userId: user.id, email: profileEmail },
     JWT_SECRET,
     { expiresIn: JWT_EXPIRES_IN }
   );
 }
 
-function setTokenCookie(res, token) {
-  const MS_PER_DAY = 24 * 60 * 60 * 1000;
-  const days = parseInt(JWT_EXPIRES_IN) || 7;
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
 
+function setTokenCookie(res, token) {
   res.cookie("token", token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "strict",
-    maxAge: days * MS_PER_DAY
+    maxAge: getTokenMaxAgeMs()
   });
 }
 
@@ -49,14 +74,15 @@ const authService = {
     try {
       const { name, email, password } = req.body;
       const debugEnabled = String(process.env.AUTH_DEBUG || "").toLowerCase() === "true";
+      const normalizedEmail = normalizeEmail(email);
       const debugInfo = {
         hasName: Boolean(name),
-        hasEmail: Boolean(email),
+        hasEmail: Boolean(normalizedEmail),
         hasPassword: Boolean(password),
         passwordLength: typeof password === "string" ? password.length : null
       };
 
-      if (!name || !email || !password) {
+      if (!name || !normalizedEmail || !password) {
         return res.status(400).json({
           error: "name, email and password are required.",
           ...(debugEnabled ? { debug: debugInfo } : {})
@@ -70,21 +96,37 @@ const authService = {
         });
       }
 
-      const existing = await User.findOne({ where: { email } });
-      if (existing) {
+      const existingByAccountEmail = await Account.findOne({ where: { email: normalizedEmail } });
+      const existingByUserEmail = await User.findOne({ where: { email: normalizedEmail } });
+
+      if (existingByAccountEmail || existingByUserEmail) {
         return res.status(409).json({ error: "An account with that email already exists." });
       }
 
       const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
 
-      const user = await User.create({ name, email, password_hash });
+      const user = await User.create({
+        name,
+        email: normalizedEmail,
+        password_hash
+      });
 
-      const token = generateToken(user);
+      await Account.create({
+        user_id: user.id,
+        provider: "local",
+        provider_account_id: normalizedEmail,
+        email: normalizedEmail,
+        display_name: name,
+        is_primary: true
+      });
+
+      const userWithAccounts = await userService.getUserById(user.id);
+      const token = generateToken(userWithAccounts);
       setTokenCookie(res, token);
 
       return res.status(201).json({
         message: "Account created successfully.",
-        user: userService.getCleanProfile(user)
+        user: userService.getCleanProfile(userWithAccounts)
       });
     } catch (error) {
       console.error("[authService.register]", error);
@@ -100,14 +142,28 @@ const authService = {
   async login(req, res) {
     try {
       const { email, password } = req.body;
+      const normalizedEmail = normalizeEmail(email);
 
-      if (!email || !password) {
+      if (!normalizedEmail || !password) {
         return res.status(400).json({ error: "email and password are required." });
       }
 
-      const user = await User.findOne({ where: { email } });
+      const account = await Account.findOne({
+        where: { email: normalizedEmail },
+        order: [["is_primary", "DESC"], ["updatedAt", "DESC"], ["createdAt", "DESC"]]
+      });
+
+      let user = null;
+
+      if (account) {
+        user = await User.findByPk(account.user_id);
+      }
+
+      if (!user) {
+        user = await User.findOne({ where: { email: normalizedEmail } });
+      }
+
       if (!user || !user.password_hash) {
-        // Vague message to prevent user enumeration
         return res.status(401).json({ error: "Invalid email or password." });
       }
 
@@ -116,12 +172,13 @@ const authService = {
         return res.status(401).json({ error: "Invalid email or password." });
       }
 
-      const token = generateToken(user);
+      const userWithAccounts = await userService.getUserById(user.id);
+      const token = generateToken(userWithAccounts);
       setTokenCookie(res, token);
 
       return res.json({
         message: "Logged in successfully.",
-        user: userService.getCleanProfile(user)
+        user: userService.getCleanProfile(userWithAccounts)
       });
     } catch (error) {
       console.error("[authService.login]", error);

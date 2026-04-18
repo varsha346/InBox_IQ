@@ -1,6 +1,6 @@
 const jwt = require("jsonwebtoken");
 const { Op } = require("sequelize");
-const { Email, EmailPriority } = require("../models");
+const { Email, EmailPriority, Account } = require("../models");
 const userService = require("./userservice");
 const priorityService = require("./priorityservice");
 const sseService = require("./sseservice");
@@ -13,6 +13,28 @@ const OUTLOOK_CLIENT_ID = normalizeEnv(process.env.OUTLOOK_CLIENT_ID);
 const OUTLOOK_CLIENT_SECRET = normalizeEnv(process.env.OUTLOOK_CLIENT_SECRET);
 const OUTLOOK_REDIRECT_URI = normalizeEnv(process.env.OUTLOOK_REDIRECT_URI);
 const FRONTEND_URL = normalizeEnv(process.env.FRONTEND_URL) || "http://localhost:5173";
+const APP_JWT_EXPIRES_IN = normalizeEnv(process.env.JWT_EXPIRES_IN) || "7d";
+
+function getTokenMaxAgeMs() {
+  const raw = String(APP_JWT_EXPIRES_IN || "").trim().toLowerCase();
+  const match = raw.match(/^(\d+)([smhd])$/);
+
+  if (match) {
+    const value = Number(match[1]);
+    const unit = match[2];
+
+    if (unit === "s") return value * 1000;
+    if (unit === "m") return value * 60 * 1000;
+    if (unit === "h") return value * 60 * 60 * 1000;
+    if (unit === "d") return value * 24 * 60 * 60 * 1000;
+  }
+
+  if (/^\d+$/.test(raw)) {
+    return Number(raw) * 1000;
+  }
+
+  return 7 * 24 * 60 * 60 * 1000;
+}
 
 const AUTH_BASE = "https://login.microsoftonline.com/common/oauth2/v2.0";
 const TOKEN_URL = `${AUTH_BASE}/token`;
@@ -104,7 +126,7 @@ function setTokenCookie(res, token) {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "strict",
-    maxAge: 7 * 24 * 60 * 60 * 1000
+    maxAge: getTokenMaxAgeMs()
   });
 }
 
@@ -212,17 +234,19 @@ const outlookService = {
     try {
       ensureOutlookConfig();
       const { code, error } = req.query;
+      const linkedUserId = resolveLinkedUserId(req, "outlook");
+      const isLinkedFlow = Boolean(linkedUserId);
 
       if (error) {
         if (!requestWantsJson(req)) {
-          return res.redirect(buildFrontendUrl("/auth/outlook/callback", { error }));
+          return res.redirect(buildFrontendUrl(isLinkedFlow ? "/settings" : "/login", { oauthError: error }));
         }
         return res.status(400).json({ error: `Authorization denied: ${error}` });
       }
 
       if (!code) {
         if (!requestWantsJson(req)) {
-          return res.redirect(buildFrontendUrl("/auth/outlook/callback", { error: "Authorization code not found" }));
+          return res.redirect(buildFrontendUrl(isLinkedFlow ? "/settings" : "/login", { oauthError: "Authorization code not found" }));
         }
         return res.status(400).json({ error: "Authorization code not found" });
       }
@@ -243,8 +267,6 @@ const outlookService = {
         throw new Error("Outlook profile is missing an email address");
       }
 
-      const linkedUserId = resolveLinkedUserId(req, "outlook");
-
       const user = await userService.createOrUpdateOutlookUser({
         id: me.id,
         email,
@@ -264,13 +286,13 @@ const outlookService = {
       const jwtToken = jwt.sign(
         { userId: user.id },
         process.env.JWT_SECRET,
-        { expiresIn: "1h" }
+        { expiresIn: APP_JWT_EXPIRES_IN }
       );
 
       setTokenCookie(res, jwtToken);
 
       if (!requestWantsJson(req)) {
-        return res.redirect(buildFrontendUrl("/dashboard", {
+        return res.redirect(buildFrontendUrl(isLinkedFlow ? "/settings" : "/dashboard", {
           userId: user.id,
           provider: "outlook",
           oauth: "success"
@@ -339,7 +361,7 @@ const outlookService = {
       const newJwt = jwt.sign(
         { userId: user.id },
         process.env.JWT_SECRET,
-        { expiresIn: "7d" }
+        { expiresIn: APP_JWT_EXPIRES_IN }
       );
 
       setTokenCookie(res, newJwt);

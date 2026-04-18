@@ -10,6 +10,28 @@ const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI;
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+const APP_JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || "7d";
+
+function getTokenMaxAgeMs() {
+  const raw = String(APP_JWT_EXPIRES_IN || "").trim().toLowerCase();
+  const match = raw.match(/^(\d+)([smhd])$/);
+
+  if (match) {
+    const value = Number(match[1]);
+    const unit = match[2];
+
+    if (unit === "s") return value * 1000;
+    if (unit === "m") return value * 60 * 1000;
+    if (unit === "h") return value * 60 * 60 * 1000;
+    if (unit === "d") return value * 24 * 60 * 60 * 1000;
+  }
+
+  if (/^\d+$/.test(raw)) {
+    return Number(raw) * 1000;
+  }
+
+  return 7 * 24 * 60 * 60 * 1000;
+}
 
 function buildFrontendUrl(path, params = {}) {
   const url = new URL(path, FRONTEND_URL);
@@ -79,7 +101,7 @@ function setTokenCookie(res, token) {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "strict",
-    maxAge: 7 * 24 * 60 * 60 * 1000
+    maxAge: getTokenMaxAgeMs()
   });
 }
 
@@ -157,7 +179,7 @@ const gmailService = {
       const newJwt = jwt.sign(
         { userId: user.id },
         process.env.JWT_SECRET,
-        { expiresIn: "7d" }
+        { expiresIn: APP_JWT_EXPIRES_IN }
       );
 
       setTokenCookie(res, newJwt);
@@ -377,7 +399,7 @@ const gmailService = {
       const jwtToken = jwt.sign(
         { userId: user.id },
         process.env.JWT_SECRET,
-        { expiresIn: "1h" }
+        { expiresIn: APP_JWT_EXPIRES_IN }
       );
 
       setTokenCookie(res, jwtToken);

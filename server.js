@@ -124,29 +124,6 @@ async function ensureDatabaseCompatibility() {
     allowNull: true
   });
 
-  await addColumnIfMissing("users", "outlook_id", {
-    type: DataTypes.STRING,
-    allowNull: true
-  });
-
-  await addColumnIfMissing("users", "outlook_email", {
-    type: DataTypes.STRING,
-    allowNull: true
-  });
-
-  await addColumnIfMissing("users", "encrypted_outlook_access_token", {
-    type: DataTypes.TEXT,
-    allowNull: true
-  });
-  await addColumnIfMissing("users", "encrypted_outlook_refresh_token", {
-    type: DataTypes.TEXT,
-    allowNull: true
-  });
-  await addColumnIfMissing("users", "outlook_token_expiry", {
-    type: DataTypes.DATE,
-    allowNull: true
-  });
-
   await renameColumnIfNeeded("emails", "gmail_message_id", "mail_msg_id");
   await renameColumnIfNeeded("emails", "gmail_thread_id", "mail_thread_id");
   await renameColumnIfNeeded("emails", "gmail_link", "mail_link");
@@ -175,7 +152,6 @@ async function ensureDatabaseCompatibility() {
     defaultValue: "gmail"
   });
 
-  await sequelize.query("UPDATE users SET outlook_email = email WHERE outlook_id IS NOT NULL AND (outlook_email IS NULL OR outlook_email = '')");
   await sequelize.query("UPDATE emails SET provider = 'gmail' WHERE provider IS NULL");
 }
 
@@ -253,7 +229,6 @@ app.get("/auth/outlook/callback", outlookService.oauthCallback);
 
 // Mount OAuth callback directly at /login/oauth2/code/google (as per .env REDIRECT_URI)
 app.use("/login/oauth2/code", gmailRoutes);
-app.use("/login/oauth2/code", outlookRoutes);
 
 // Mount other Gmail routes
 app.use("/gmail", gmailRoutes);
@@ -288,7 +263,11 @@ try {
   redirectUriPort = 0;
 }
 
-const PORT = redirectUriPort || Number(process.env.PORT) || 8000;
+const PORT = Number(process.env.PORT) || redirectUriPort || 8000;
+
+app.get("/health", (req, res) => {
+  return res.status(200).json({ status: "ok" });
+});
 
 async function bootstrap() {
   await sequelize.sync();
