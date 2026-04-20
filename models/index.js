@@ -8,6 +8,8 @@ const Label = require("./label")(sequelize, DataTypes);
 const EmailLabel = require("./emaillabel")(sequelize, DataTypes);
 const EmailPriority = require("./emailpriority")(sequelize, DataTypes);
 const EmailProcessingLog = require("./emailprocessinglog")(sequelize, DataTypes);
+const Notification = require("./notification")(sequelize, DataTypes);
+const EmailAction = require("./emailaction")(sequelize, DataTypes);
 
 /* Associations */
 
@@ -35,6 +37,18 @@ EmailPriority.belongsTo(Email, { foreignKey: "email_id" });
 
 Email.hasMany(EmailProcessingLog, { foreignKey: "email_id" });
 
+User.hasMany(Notification, { foreignKey: "user_id" });
+Notification.belongsTo(User, { foreignKey: "user_id" });
+
+Email.hasMany(Notification, { foreignKey: "email_id" });
+Notification.belongsTo(Email, { foreignKey: "email_id" });
+
+User.hasMany(EmailAction, { foreignKey: "user_id" });
+EmailAction.belongsTo(User, { foreignKey: "user_id" });
+
+Email.hasMany(EmailAction, { foreignKey: "email_id" });
+EmailAction.belongsTo(Email, { foreignKey: "email_id" });
+
 module.exports = {
   sequelize,
   User,
@@ -43,5 +57,7 @@ module.exports = {
   Label,
   EmailLabel,
   EmailPriority,
-  EmailProcessingLog
+  EmailProcessingLog,
+  Notification,
+  EmailAction
 };

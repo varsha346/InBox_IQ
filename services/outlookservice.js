@@ -3,6 +3,7 @@ const { Op } = require("sequelize");
 const { Email, EmailPriority, Account } = require("../models");
 const userService = require("./userservice");
 const priorityService = require("./priorityservice");
+const notificationService = require("./notificationservice");
 const sseService = require("./sseservice");
 
 function normalizeEnv(value) {
@@ -499,6 +500,12 @@ const outlookService = {
       const payloadEmails = savedEmails.map((email) => (
         typeof email.toJSON === "function" ? email.toJSON() : email
       ));
+
+      notificationService.createSyncSummaryNotification({
+        userId,
+        provider: "outlook",
+        newEmails: payloadEmails
+      }).catch(() => {});
 
       sseService.broadcastToUser(String(userId), "new_emails", {
         userId,

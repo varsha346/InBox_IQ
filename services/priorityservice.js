@@ -5,7 +5,6 @@ const processingService = require("./processingservice");
 // ========== CONFIG ==========
 const OPENROUTER_API_KEY = String(process.env.OPENROUTER_API_KEY || "").trim();
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "xiaomi/mimo-v2-pro";
-const OPENROUTER_FALLBACK_ON_ERROR = String(process.env.OPENROUTER_FALLBACK_ON_ERROR || "false").toLowerCase() === "true";
 const PRIORITY_USE_SNIPPET_ONLY = String(process.env.PRIORITY_USE_SNIPPET_ONLY || "true").toLowerCase() === "true";
 const VALID_LABELS = ["LOW", "NORMAL", "IMPORTANT", "URGENT"];
 const MAX_TEXT_LENGTH = 4000;
@@ -272,54 +271,6 @@ function normalizeModelResult(parsed) {
     };
 }
 
-function buildHeuristicPriority(subject, snippet, sender, userInput = "") {
-    const text = `${subject || ""} ${snippet || ""} ${sender || ""} ${userInput || ""}`.toLowerCase();
-
-    const urgentSignals = ["urgent", "asap", "immediately", "escalation", "outage", "production down", "sev1", "p1"];
-    const importantSignals = ["deadline", "client", "customer", "invoice", "payment", "meeting", "approval", "follow up", "blocked"];
-    const lowSignals = ["newsletter", "promo", "promotion", "discount", "sale", "unsubscribe", "social", "marketing"];
-
-    const hasAny = (signals) => signals.some((signal) => text.includes(signal));
-
-    if (hasAny(urgentSignals)) {
-        return {
-            priority_label: "URGENT",
-            priority_score: 0.92,
-            confidence: 0.72,
-            reason: "Fallback: urgent keywords detected.",
-            mode: "SYSTEM_DEFAULT"
-        };
-    }
-
-    if (hasAny(importantSignals)) {
-        return {
-            priority_label: "IMPORTANT",
-            priority_score: 0.74,
-            confidence: 0.68,
-            reason: "Fallback: important business keywords detected.",
-            mode: "SYSTEM_DEFAULT"
-        };
-    }
-
-    if (hasAny(lowSignals)) {
-        return {
-            priority_label: "LOW",
-            priority_score: 0.2,
-            confidence: 0.7,
-            reason: "Fallback: likely promotional content.",
-            mode: "SYSTEM_DEFAULT"
-        };
-    }
-
-    return {
-        priority_label: "NORMAL",
-        priority_score: 0.5,
-        confidence: 0.6,
-        reason: "Fallback: no strong priority signals.",
-        mode: "SYSTEM_DEFAULT"
-    };
-}
-
 function normalizeUserIdInput(input) {
     if (!input) return null;
     if (typeof input === "string") return input;
@@ -361,7 +312,6 @@ const priorityService = {
             provider: "openrouter",
             model: OPENROUTER_MODEL,
             hasApiKey: Boolean(OPENROUTER_API_KEY),
-            fallbackOnError: OPENROUTER_FALLBACK_ON_ERROR,
             useSnippetOnly: PRIORITY_USE_SNIPPET_ONLY,
             recentDefaults: {
                 days: DEFAULT_RECENT_DAYS,
@@ -721,28 +671,13 @@ const priorityService = {
         await processingService.beginProcessing(email.id);
 
         try {
-            let result;
-
-            try {
-                result = await priorityService.analyzeWithProvider(
-                    email.subject,
-                    email.snippet,
-                    email.sender_email,
-                    analysisContext,
-                    userInput
-                );
-            } catch (error) {
-                if (OPENROUTER_FALLBACK_ON_ERROR) {
-                    result = buildHeuristicPriority(
-                        email.subject,
-                        email.snippet,
-                        email.sender_email,
-                        userInput
-                    );
-                } else {
-                    throw error;
-                }
-            }
+            const result = await priorityService.analyzeWithProvider(
+                email.subject,
+                email.snippet,
+                email.sender_email,
+                analysisContext,
+                userInput
+            );
 
             await priorityService.savePriority(email.id, result);
             await processingService.markProcessingCompleted(email.id);

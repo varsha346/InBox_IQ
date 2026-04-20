@@ -2,6 +2,7 @@ const { google } = require("googleapis");
 const { Email, Label, EmailPriority, Account } = require("../models");
 const userService = require("./userservice");
 const priorityService = require("./priorityservice");
+const notificationService = require("./notificationservice");
 const sseService = require("./sseservice");
 const { Op } = require("sequelize");
 const jwt = require("jsonwebtoken");
@@ -731,6 +732,12 @@ const gmailService = {
       const payloadEmails = savedEmails.map((email) => (
         typeof email.toJSON === "function" ? email.toJSON() : email
       ));
+
+      notificationService.createSyncSummaryNotification({
+        userId,
+        provider: "gmail",
+        newEmails: payloadEmails
+      }).catch(() => {});
 
       sseService.broadcastToUser(String(userId), "new_emails", {
         userId,
